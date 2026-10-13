@@ -4,7 +4,7 @@ import json
 import time
 import random # For more unique tool_call_id
 import urllib.parse
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
 
 from google.genai import types
@@ -738,10 +738,37 @@ def convert_to_openai_format(gemini_response: Any, model: str) -> Dict[str, Any]
     return process_gemini_response_to_openai_dict(gemini_response, model)
 
 
-def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0) -> str:
+class GeminiStreamState:
+    """Track tool indices and response progress across a single Gemini stream."""
+
+    def __init__(self):
+        self.next_tool_call_index = 0
+        self.role_emitted = False
+        self.has_output = False
+        self.has_reasoning = False
+        self.finish_reason: Optional[str] = None
+
+
+def convert_chunk_to_openai(
+    chunk: Any,
+    model_name: str,
+    response_id: str,
+    candidate_index: int = 0,
+    stream_state: Optional[GeminiStreamState] = None,
+) -> str:
+    state = stream_state if stream_state is not None else GeminiStreamState()
     is_encrypt_full = model_name.endswith("-encrypt-full")
     delta_payload = {}
     openai_finish_reason = None
+
+    if not state.role_emitted:
+        delta_payload["role"] = "assistant"
+        state.role_emitted = True
+
+    prompt_feedback = getattr(chunk, "prompt_feedback", None)
+    block_reason = getattr(prompt_feedback, "block_reason", None)
+    if block_reason and getattr(block_reason, "name", str(block_reason)) != "BLOCKED_REASON_UNSPECIFIED":
+        raise ValueError(f"Gemini blocked the request: {block_reason}")
 
     if hasattr(chunk, 'candidates') and chunk.candidates:
         candidate = chunk.candidates[0] # Process first candidate for streaming
@@ -752,20 +779,26 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
             if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
             elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-            elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
+            elif raw_gemini_finish_reason_str in ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"]: openai_finish_reason = "content_filter"
             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
-            # Not setting a default here; None means intermediate chunk unless reason is terminal.
+            elif raw_gemini_finish_reason_str in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"]:
+                detail = getattr(candidate, "finish_message", None) or raw_gemini_finish_reason_str
+                raise ValueError(f"Gemini could not generate a valid tool call: {detail}")
+            elif raw_gemini_finish_reason_str != "FINISH_REASON_UNSPECIFIED":
+                openai_finish_reason = "stop"
 
         function_call_detected_in_chunk = False
         if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts') and candidate.content.parts:
             for part in candidate.content.parts:
                 if hasattr(part, 'function_call') and part.function_call is not None: # Kilo Code: Added 'is not None' check
                     fc = part.function_call
+                    if not fc.name:
+                        raise ValueError("Gemini returned a function call without a name.")
                     raw_tool_call_id = getattr(fc, 'id', None) or f"call_{response_id}_{candidate_index}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
                     tool_call_id = _encode_tool_call_id_with_thought_signature(raw_tool_call_id, getattr(part, 'thought_signature', None))
                     
                     current_tool_call_delta = {
-                        "index": 0, 
+                        "index": state.next_tool_call_index,
                         "id": tool_call_id,
                         "type": "function",
                         "function": {"name": fc.name}
@@ -778,31 +811,41 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     if "tool_calls" not in delta_payload:
                         delta_payload["tool_calls"] = []
                     delta_payload["tool_calls"].append(current_tool_call_delta)
+                    state.next_tool_call_index += 1
+                    state.has_output = True
                     
                     delta_payload["content"] = None 
                     function_call_detected_in_chunk = True
-                    # If this chunk also has the finish_reason for tool_calls, it will be set.
-                    break 
 
-        if not function_call_detected_in_chunk:
-            reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
-            if is_encrypt_full:
-                reasoning_text = deobfuscate_text(reasoning_text)
-                normal_text = deobfuscate_text(normal_text)
+        reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+        if is_encrypt_full:
+            reasoning_text = deobfuscate_text(reasoning_text)
+            normal_text = deobfuscate_text(normal_text)
 
-            if app_config.SAFETY_SCORE and hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
-                safety_html = _create_safety_ratings_html(candidate.safety_ratings)
-                if reasoning_text:
-                    reasoning_text += safety_html
-                else:
-                    normal_text += safety_html
+        if app_config.SAFETY_SCORE and hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+            safety_html = _create_safety_ratings_html(candidate.safety_ratings)
+            if reasoning_text:
+                reasoning_text += safety_html
+            else:
+                normal_text += safety_html
 
-            if reasoning_text: delta_payload['reasoning_content'] = reasoning_text
-            if normal_text: # Only add content if it's non-empty
-                delta_payload['content'] = normal_text
-            elif not reasoning_text and not delta_payload.get("tool_calls") and openai_finish_reason is None:
-                # If no other content and not a terminal chunk, send empty content string
-                delta_payload['content'] = ""
+        if reasoning_text:
+            delta_payload['reasoning_content'] = reasoning_text
+            state.has_reasoning = True
+        if normal_text:
+            delta_payload['content'] = normal_text
+            state.has_output = True
+        elif not reasoning_text and not function_call_detected_in_chunk and openai_finish_reason is None:
+            delta_payload['content'] = ""
+
+        if openai_finish_reason == "stop" and state.next_tool_call_index:
+            openai_finish_reason = "tool_calls"
+
+        if openai_finish_reason is not None:
+            state.finish_reason = openai_finish_reason
+            if not state.has_output:
+                detail = getattr(candidate, "finish_message", None) or str(raw_gemini_finish_reason)
+                raise ValueError(f"Gemini returned no text or tool calls (finish reason: {detail}).")
     
     if not delta_payload and openai_finish_reason is None:
         # This case ensures that even if a chunk is completely empty (e.g. keep-alive or error scenario not caught above)
@@ -816,12 +859,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
     # Logprobs are typically not in streaming deltas for OpenAI.
     return f"data: {json.dumps(chunk_data)}\n\n"
 
-def create_final_chunk(model: str, response_id: str, candidate_count: int = 1) -> str:
-    # This function might need adjustment if the finish reason isn't always "stop"
-    # For now, it's kept as is, but tool_calls might require a different final chunk structure
-    # if not handled by the last delta from convert_chunk_to_openai.
-    # However, OpenAI expects the last content/tool_call delta to carry the finish_reason.
-    # This function is more of a safety net or for specific scenarios.
-    choices = [{"index": i, "delta": {}, "finish_reason": "stop"} for i in range(candidate_count)]
+def create_final_chunk(model: str, response_id: str, candidate_count: int = 1, finish_reason: str = "stop") -> str:
+    """Emit a terminal chunk when the upstream stream omits one."""
+    choices = [{"index": i, "delta": {}, "finish_reason": finish_reason} for i in range(candidate_count)]
     final_chunk_data = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": choices}
     return f"data: {json.dumps(final_chunk_data)}\n\n"

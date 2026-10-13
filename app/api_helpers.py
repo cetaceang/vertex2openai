@@ -14,6 +14,8 @@ from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
     convert_to_openai_format,
     convert_chunk_to_openai,
+    create_final_chunk,
+    GeminiStreamState,
     extract_reasoning_by_tags,
     _create_safety_ratings_html
 )
@@ -443,10 +445,42 @@ async def execute_gemini_call(
                 config=gen_config_dict
             )
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+            stream_state = GeminiStreamState()
+
+            async def close_stream():
+                close = getattr(stream_gen_obj, "aclose", None)
+                if close is not None:
+                    await close()
+
+            # Some SDK/network errors are deferred until the iterator is consumed.
+            # Wait for text, reasoning, or a tool call before sending HTTP 200.
+            initial_chunks = []
+            try:
+                async for first_chunk in stream_gen_obj:
+                    initial_chunks.append(convert_chunk_to_openai(
+                        first_chunk, request_obj.model, response_id_for_stream, 0, stream_state
+                    ))
+                    if stream_state.has_output or stream_state.has_reasoning:
+                        break
+                if not stream_state.has_output and not stream_state.has_reasoning:
+                    raise ValueError("Gemini returned an empty response stream (no text or tool calls).")
+            except BaseException:
+                await close_stream()
+                raise
+
             async def _gemini_real_stream_generator_inner():
                 try:
+                    for initial_chunk in initial_chunks:
+                        yield initial_chunk
                     async for chunk_item_call in stream_gen_obj:
-                        yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
+                        yield convert_chunk_to_openai(
+                            chunk_item_call, request_obj.model, response_id_for_stream, 0, stream_state
+                        )
+                    if not stream_state.has_output:
+                        raise ValueError("Gemini returned no text or tool calls before the stream ended.")
+                    if stream_state.finish_reason is None:
+                        finish_reason = "tool_calls" if stream_state.next_tool_call_index else "stop"
+                        yield create_final_chunk(request_obj.model, response_id_for_stream, finish_reason=finish_reason)
                     yield "data: [DONE]\n\n"
                 except Exception as e_stream_call:
                     err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
@@ -457,6 +491,8 @@ async def execute_gemini_call(
                     # Streaming has started, so report the failure through SSE.
                     yield f"data: {j_err}\n\n"
                     yield "data: [DONE]\n\n"
+                finally:
+                    await close_stream()
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
         response_obj_call = await current_client.aio.models.generate_content(
