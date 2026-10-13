@@ -14,6 +14,9 @@ services:
       - CREDENTIALS_DIR=/app/credentials
       # API key for authentication (default: 123456)
       - API_KEY=123456
+      # Vertex Express API key and region (default: global)
+      - VERTEX_EXPRESS_API_KEY=${VERTEX_EXPRESS_API_KEY:-}
+      - VERTEX_EXPRESS_LOCATION=${VERTEX_EXPRESS_LOCATION:-global}
       # Enable/disable fake streaming (default: false)
       - FAKE_STREAMING=false
       # Interval for fake streaming keep-alive messages (default: 1.0)

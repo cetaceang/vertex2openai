@@ -50,7 +50,8 @@ class ExpressClientWrapper:
         self.project_id = project_id
         self.api_key = api_key
         self.location = location
-        self.base_url = f"https://aiplatform.googleapis.com/v1beta1/projects/{self.project_id}/locations/{self.location}/endpoints/openapi"
+        hostname = "aiplatform.googleapis.com" if self.location == "global" else f"{self.location}-aiplatform.googleapis.com"
+        self.base_url = f"https://{hostname}/v1beta1/projects/{self.project_id}/locations/{self.location}/endpoints/openapi"
         
         # The 'chat.completions' structure mimics the real OpenAI client
         self.chat = self
@@ -465,8 +466,12 @@ class OpenAIDirectHandler:
                 _, express_api_key = key_tuple
                 project_id = await discover_project_id(express_api_key)
                 
-                client = ExpressClientWrapper(project_id=project_id, api_key=express_api_key)
-                print(f"INFO: [OpenAI Express Path] Using ExpressClientWrapper for project: {project_id}")
+                client = ExpressClientWrapper(
+                    project_id=project_id,
+                    api_key=express_api_key,
+                    location=app_config.VERTEX_EXPRESS_LOCATION,
+                )
+                print(f"INFO: [OpenAI Express Path] Using ExpressClientWrapper for project: {project_id} (location: {app_config.VERTEX_EXPRESS_LOCATION})")
 
             else: # Standard SA-based OpenAI SDK Path
                 if not self.credential_manager:

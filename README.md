@@ -59,6 +59,7 @@ Manage environment variables using a [`.env`](.env) file in the project root (ig
 
 1.  **Method 1: Vertex Express API Key**
     *   Set the [`VERTEX_EXPRESS_API_KEY`](app/config.py:0) environment variable.
+    *   Optionally set `VERTEX_EXPRESS_LOCATION` to route all Express models and variants (including `-openai` and `-openaisearch`) to one region. The default is `global`; regional values such as `us-central1` use the corresponding regional endpoint. Docker Compose passes both variables from your shell or `.env` file into the container.
 2.  **Method 2: Service Account JSON Content**
     *   Set [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) to the full JSON content of your service account key(s). For multiple keys, separate the JSON objects with a comma (e.g., `{...},{...}`).
 3.  **Method 3: Service Account Files in Directory**
@@ -79,6 +80,7 @@ API_KEY="your_secure_api_key_here" # REQUIRED: Set a strong key for security
 # ---
 
 # --- Optional Settings ---
+# VERTEX_EXPRESS_LOCATION="global" # Region for all Express models (e.g. us-central1)
 # ROUNDROBIN="true"              # Enable round-robin for Service Accounts (Method 2 or 3)
 # FAKE_STREAMING="false"         # For debugging - simulate streaming
 # FAKE_STREAMING_INTERVAL="1.0"  # Interval for fake streaming keep-alives
@@ -149,6 +151,7 @@ Managed in [`app/config.py`](app/config.py) and loaded from the environment:
 
 -   `API_KEY`: **Required.** Secret key to authenticate requests *to this adapter*.
 -   `VERTEX_EXPRESS_API_KEY`: Optional. Your Vertex AI Express API key for simplified authentication.
+-   `VERTEX_EXPRESS_LOCATION`: Optional. Region for all Vertex Express model requests, including OpenAI Direct variants. Uses the global endpoint for `global` and a regional endpoint for other values (e.g. `us-central1`). Unset or blank values default to `global`.
 -   `GOOGLE_CREDENTIALS_JSON`: Optional. String containing the JSON content of one or more service account keys (comma-separated for multiple). Takes precedence over `CREDENTIALS_DIR` for service accounts.
 -   `CREDENTIALS_DIR`: Optional. Path *within the container* where service account `.json` files are located. Used only if `GOOGLE_CREDENTIALS_JSON` is not set. (Default: `/app/credentials`)
 -   `ROUNDROBIN`: Optional. Set to `"true"` to enable round-robin selection among loaded Service Account credentials. (Default: `"false"`)

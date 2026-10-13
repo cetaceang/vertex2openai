@@ -23,6 +23,9 @@ if raw_vertex_keys:
 else:
     VERTEX_EXPRESS_API_KEY_VAL = []
 
+# Region used by all Vertex Express model requests
+VERTEX_EXPRESS_LOCATION = os.environ.get("VERTEX_EXPRESS_LOCATION", "global").strip() or "global"
+
 # Fake streaming settings for debugging/testing
 FAKE_STREAMING_ENABLED = os.environ.get("FAKE_STREAMING", "false").lower() == "true"
 FAKE_STREAMING_INTERVAL_SECONDS = float(os.environ.get("FAKE_STREAMING_INTERVAL", "1.0"))

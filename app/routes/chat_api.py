@@ -8,6 +8,7 @@ from google.genai import types
 from google import genai
 
 # Local module imports
+import config as app_config
 from models import OpenAIRequest
 from auth import get_api_key
 from message_processing import (
@@ -133,20 +134,17 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 if key_tuple:
                     original_idx, key_val = key_tuple
                     try:
-                        # Check if model contains "gemini-2.5-pro" or "gemini-2.5-flash" for direct URL approach
-                        if "gemini-2.5-pro" in base_model_name or "gemini-2.5-flash" in base_model_name:
-                            project_id = await discover_project_id(key_val)
-                            base_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global"
-                            client_to_use = genai.Client(
-                                vertexai=True,
-                                api_key=key_val,
-                                http_options=types.HttpOptions(base_url=base_url)
-                            )
-                            client_to_use._api_client._http_options.api_version = None
-                            print(f"INFO: Attempt {attempt+1}/{total_keys} - Using Vertex Express Mode with custom base URL for model {request.model} (base: {base_model_name}) with API key (original index: {original_idx}).")
-                        else:
-                            client_to_use = genai.Client(vertexai=True, api_key=key_val)
-                            print(f"INFO: Attempt {attempt+1}/{total_keys} - Using Vertex Express Mode SDK for model {request.model} (base: {base_model_name}) with API key (original index: {original_idx}).")
+                        project_id = await discover_project_id(key_val)
+                        location = app_config.VERTEX_EXPRESS_LOCATION
+                        hostname = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+                        base_url = f"https://{hostname}/v1/projects/{project_id}/locations/{location}"
+                        client_to_use = genai.Client(
+                            vertexai=True,
+                            api_key=key_val,
+                            # The base URL already includes the API version and location.
+                            http_options=types.HttpOptions(base_url=base_url, api_version="")
+                        )
+                        print(f"INFO: Attempt {attempt+1}/{total_keys} - Using Vertex Express Mode for model {request.model} (base: {base_model_name}, location: {location}) with API key (original index: {original_idx}).")
                         break # Successfully initialized client
                     except Exception as e:
                         print(f"WARNING: Attempt {attempt+1}/{total_keys} - Vertex Express Mode client init failed for API key (original index: {original_idx}) for model {request.model}: {e}. Trying next key.")
