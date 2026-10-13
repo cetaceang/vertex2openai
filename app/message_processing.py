@@ -183,11 +183,12 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
     print("Converting OpenAI messages to Gemini format...")
     gemini_messages = []
     pending_function_response_parts = []
+    function_names_by_id: Dict[str, str] = {}
 
     def flush_pending_function_response_parts():
         nonlocal pending_function_response_parts
         if pending_function_response_parts:
-            gemini_messages.append(types.Content(role="function", parts=pending_function_response_parts))
+            gemini_messages.append(types.Content(role="user", parts=pending_function_response_parts))
             pending_function_response_parts = []
 
     for idx, message in enumerate(messages):
@@ -196,19 +197,21 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
         current_gemini_role = "" 
 
         if role == "tool":
-            function_name = message.name or _infer_function_name_from_tool_call_id(message.tool_call_id)
+            function_response_id, _ = _decode_tool_call_id_thought_signature(message.tool_call_id)
+            function_name = (
+                message.name
+                or function_names_by_id.get(function_response_id)
+                or _infer_function_name_from_tool_call_id(message.tool_call_id)
+            )
             if function_name and message.tool_call_id and message.content is not None:
-                function_response_id, _ = _decode_tool_call_id_thought_signature(message.tool_call_id)
-                tool_output_data = {}
-                try:
-                    if isinstance(message.content, str) and \
-                       (message.content.strip().startswith("{") and message.content.strip().endswith("}")) or \
-                       (message.content.strip().startswith("[") and message.content.strip().endswith("]")):
-                        tool_output_data = json.loads(message.content)
-                    else: 
-                        tool_output_data = {"result": message.content}
-                except json.JSONDecodeError:
-                    tool_output_data = {"result": str(message.content)}
+                tool_output_data = message.content
+                if isinstance(tool_output_data, str):
+                    try:
+                        tool_output_data = json.loads(tool_output_data)
+                    except json.JSONDecodeError:
+                        pass
+                if not isinstance(tool_output_data, dict):
+                    tool_output_data = {"result": tool_output_data}
 
                 parts.append(_build_function_response_part(
                     function_name=function_name,
@@ -235,6 +238,8 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                     parsed_arguments = {} 
                 
                 if function_name:
+                    if raw_tool_call_id:
+                        function_names_by_id[raw_tool_call_id] = function_name
                     parts.append(_build_function_call_part(
                         function_name=function_name,
                         parsed_arguments=parsed_arguments,

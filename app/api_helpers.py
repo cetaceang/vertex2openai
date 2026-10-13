@@ -158,13 +158,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                         "name": func_def.get("name"),
                         "description": func_def.get("description"),
                     }
-                    # Get parameters and remove the $schema field if it exists
+                    # OpenAI tools use JSON Schema, not Gemini's restricted Schema type.
+                    # Keep nested constraints intact through the native JSON Schema field.
                     parameters = func_def.get("parameters")
                     if isinstance(parameters, dict) and "$schema" in parameters:
                         parameters = parameters.copy()
                         del parameters["$schema"]
                     if parameters is not None:
-                        declaration["parameters"] = parameters
+                        declaration["parameters_json_schema"] = parameters
 
                     # Remove keys with None values to keep the payload clean
                     declaration = {k: v for k, v in declaration.items() if v is not None}
@@ -435,14 +436,15 @@ async def execute_gemini_call(
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
+            # Validate the config and initialize the SDK call before sending HTTP headers.
+            stream_gen_obj = await current_client.aio.models.generate_content_stream(
+                model=model_to_call,
+                contents=actual_prompt_for_call,
+                config=gen_config_dict
+            )
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
                 try:
-                    stream_gen_obj = await current_client.aio.models.generate_content_stream(
-                        model=model_to_call, 
-                        contents=actual_prompt_for_call,
-                        config=gen_config_dict # Pass the dictionary directly
-                    )
                     async for chunk_item_call in stream_gen_obj:
                         yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
                     yield "data: [DONE]\n\n"
@@ -452,10 +454,9 @@ async def execute_gemini_call(
                     s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                     err_resp = create_openai_error_response(500,s_err,"server_error")
                     j_err = json.dumps(err_resp)
-                    if not is_auto_attempt: 
-                        yield f"data: {j_err}\n\n"
-                        yield "data: [DONE]\n\n"
-                    raise e_stream_call
+                    # Streaming has started, so report the failure through SSE.
+                    yield f"data: {j_err}\n\n"
+                    yield "data: [DONE]\n\n"
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
         response_obj_call = await current_client.aio.models.generate_content(
