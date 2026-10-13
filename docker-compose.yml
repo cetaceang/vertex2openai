@@ -1,8 +1,6 @@
-version: '3.8'
-
 services:
   openai-to-gemini:
-    image: ghcr.io/gzzhongqi/vertex2openai:latest
+    build: .
     container_name: vertex2openai
     ports:
       # Map host port 8050 to container port 7860 (for Hugging Face compatibility)
@@ -21,4 +19,10 @@ services:
       - FAKE_STREAMING=false
       # Interval for fake streaming keep-alive messages (default: 1.0)
       - FAKE_STREAMING_INTERVAL=1.0
+    networks:
+      - shared-net
     restart: unless-stopped
+
+networks:
+  shared-net:
+    external: true

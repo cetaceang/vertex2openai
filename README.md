@@ -50,6 +50,7 @@ The codebase is designed with modularity and maintainability in mind, located pr
 ### Prerequisites
 
 -   Docker and Docker Compose
+-   An external Docker network named `shared-net`. If it does not exist yet, create it with `docker network create shared-net`.
 -   Google Cloud Project with Vertex AI enabled.
 -   Credentials: Either a Vertex AI Express API Key or one or more Service Account key files.
 
@@ -91,11 +92,8 @@ API_KEY="your_secure_api_key_here" # REQUIRED: Set a strong key for security
 ### Running Locally
 
 ```bash
-# Build the image (if needed)
-docker-compose build
-
-# Start the service in detached mode
-docker-compose up -d
+# Build from the local Dockerfile and start the service in detached mode
+docker compose up -d --build
 ```
 The service will typically be available at `http://localhost:8050` (check your [`docker-compose.yml`](docker-compose.yml)).
 
