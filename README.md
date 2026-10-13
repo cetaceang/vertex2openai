@@ -133,6 +133,57 @@ curl -X POST http://localhost:8050/v1/chat/completions \
 
 *(Adjust URL and API Key as needed)*
 
+## Native Vertex AI Passthrough
+
+The native endpoints forward request bodies, response bodies, SSE data, upstream
+status codes, and end-to-end headers without converting them to OpenAI format or
+validating them through the Gemini SDK. Tool schemas, thought signatures, and new
+Google fields pass through unchanged. Authentication is replaced with the
+server's configured Google credentials; transport headers such as `Host` and
+`Transfer-Encoding` are managed by the proxy.
+
+Both `v1` and `v1beta1` support `GET`, `POST`, and `HEAD` on these paths:
+
+| Path | Credential selection |
+| --- | --- |
+| `/{version}/projects/{project}/locations/{location}/publishers/google/{resource}` | Service account first, then an Express key if no service account is available. The project and location in the URL are preserved. |
+| `/{version}/publishers/google/{resource}` | Express key first, using its discovered project. Otherwise, a service account's project is used. This path always uses the `global` location. |
+
+Use Google's original model ID without `[EXPRESS]` or adapter suffixes such as
+`-openai`. Native credential selection follows the path rules above; the short
+publisher path uses `VERTEX_EXPRESS_API_KEY` when configured, even without a
+model prefix. Its location is fixed to `global`, independent of
+`VERTEX_EXPRESS_LOCATION` used by the OpenAI-compatible endpoints. Full resource
+paths preserve their explicit location; include `/locations/global/` to use
+the global endpoint.
+
+Resources include `models/{model}:generateContent`,
+`models/{model}:streamGenerateContent`, `models/{model}:countTokens`, and other
+Google publisher model methods. Authenticate with this adapter's `API_KEY` using
+`Authorization: Bearer ...` or `x-goog-api-key: ...`. A `key` query parameter is
+also accepted for native clients; ingress credentials are removed before the
+request is forwarded to Google. Existing Hugging Face authentication still
+requires `x-ip-token` when enabled.
+
+For an Express deployment:
+
+```bash
+curl -N 'http://localhost:8050/v1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse' \
+  -H 'Authorization: Bearer YOUR_ADAPTER_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}'
+```
+
+For a service account, use
+`/v1/projects/YOUR_PROJECT/locations/global/publishers/google/models/gemini-2.5-flash:generateContent`
+with the same headers and body. Native responses keep Google's format and must
+be consumed by a Vertex-compatible client. OpenAI-compatible clients continue
+to use `/v1/chat/completions`.
+
+For streaming requests, HTTP `200` indicates that the stream has started. Check
+the stream body and server error logs when a client receives no usable reply;
+errors after streaming starts cannot change the HTTP status code.
+
 ## Credential Handling Priority
 
 The application selects credentials in this order:
