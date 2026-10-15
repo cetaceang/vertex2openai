@@ -1,7 +1,7 @@
 import time
 from fastapi import APIRouter, Depends, Request
 from typing import List, Dict, Any, Set
-from auth import get_api_key
+from auth import client_key_passthrough_enabled, get_api_key
 from model_loader import get_vertex_models, get_vertex_express_models, refresh_models_config_cache
 from credentials_manager import CredentialManager
 
@@ -20,7 +20,9 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
     has_sa_creds = credential_manager_instance.get_total_credentials() > 0
-    has_express_key = express_key_manager_instance.get_total_keys() > 0
+    has_express_key = express_key_manager_instance.get_total_keys() > 0 or (
+        bool(api_key) and client_key_passthrough_enabled(credential_manager_instance, express_key_manager_instance)
+    )
 
     raw_vertex_models = await get_vertex_models()
     raw_express_models = await get_vertex_express_models()

@@ -2,16 +2,16 @@ services:
   openai-to-gemini:
     build: .
     container_name: vertex2openai
-    ports:
-      # Map host port 8050 to container port 7860 (for Hugging Face compatibility)
-      - "8050:7860"
+    # Uncomment to publish the service on host port 8050.
+    # ports:
+    #   - "8050:7860"
     volumes:
       - ./credentials:/app/credentials
     environment:
       # Directory where credential files are stored (used by credential manager)
       - CREDENTIALS_DIR=/app/credentials
-      # API key for authentication (default: 123456)
-      - API_KEY=${API_KEY:-123456}
+      # Optional client authentication key; empty disables adapter authentication.
+      - API_KEY=${API_KEY:-}
       # Vertex Express API key and region (default: global)
       - VERTEX_EXPRESS_API_KEY=${VERTEX_EXPRESS_API_KEY:-}
       - VERTEX_EXPRESS_LOCATION=${VERTEX_EXPRESS_LOCATION:-global}

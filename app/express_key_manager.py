@@ -9,9 +9,9 @@ class ExpressKeyManager:
     Similar to CredentialManager but specifically for Express API keys.
     """
     
-    def __init__(self):
-        """Initialize the Express Key Manager with API keys from config."""
-        self.express_keys: List[str] = app_config.VERTEX_EXPRESS_API_KEY_VAL
+    def __init__(self, keys: Optional[List[str]] = None):
+        """Initialize configured keys or a request-local list of client keys."""
+        self.express_keys: List[str] = list(app_config.VERTEX_EXPRESS_API_KEY_VAL if keys is None else keys)
         self.round_robin_index: int = 0
         
     def get_total_keys(self) -> int:

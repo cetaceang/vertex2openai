@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends # Depends might be used by root endpoint
 from fastapi.middleware.cors import CORSMiddleware
 
 # Local module imports
-from auth import get_api_key # Potentially for root endpoint
+from auth import client_key_passthrough_enabled
 from credentials_manager import CredentialManager
 from express_key_manager import ExpressKeyManager
 from vertex_ai_init import init_vertex_ai
@@ -54,6 +54,8 @@ async def startup_event():
             print("INFO: No SA credentials found, but Express API keys are available for authentication.")
         elif express_keys_count == 0:
             print("INFO: No Express API keys found, but SA credentials are available for authentication.")
+    elif client_key_passthrough_enabled(credential_manager, express_key_manager):
+        print("INFO: No server authentication or credentials configured. Requests will use each client's Vertex Express API key.")
     else:
         print("ERROR: Failed to initialize any authentication method. Both SA credentials and Express API keys are missing. API will fail.")
 

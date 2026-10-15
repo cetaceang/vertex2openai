@@ -16,7 +16,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 import config as app_config
-from auth import get_api_key
+from auth import client_key_passthrough_enabled, get_api_key
 from project_id_discovery import discover_project_id
 
 
@@ -37,7 +37,7 @@ async def get_vertex_api_key(request: Request):
     return await get_api_key(authorization=authorization, x_ip_token=request.headers.get("x-ip-token"))
 
 
-router = APIRouter(tags=["Vertex AI passthrough"], dependencies=[Depends(get_vertex_api_key)])
+router = APIRouter(tags=["Vertex AI passthrough"])
 
 
 def _google_error(code: int, message: str, status: str):
@@ -53,7 +53,7 @@ def _forward_headers(raw_headers, excluded=()):
 
 
 def _forward_query(raw_query: bytes) -> bytes:
-    # Ingress credentials authenticate with this adapter, never with Google.
+    # Remove ingress credentials; the selected key is sent in an upstream header.
     return b"&".join(
         part for part in raw_query.split(b"&")
         if unquote_to_bytes(part.partition(b"=")[0].replace(b"+", b" "))
@@ -75,6 +75,7 @@ async def _forward_vertex(
     api_version: str,
     project: Optional[str],
     location: Optional[str],
+    api_key: str,
 ):
     express_manager = request.app.state.express_key_manager
     credentials = None
@@ -90,14 +91,19 @@ async def _forward_vertex(
     if credentials is None:
         selected_key = express_manager.get_express_api_key()
         if selected_key is None:
-            return _google_error(503, "No Vertex credentials are configured.", "FAILED_PRECONDITION")
-        _, express_key = selected_key
+            if not client_key_passthrough_enabled(request.app.state.credential_manager, express_manager):
+                return _google_error(503, "No Vertex credentials are configured.", "FAILED_PRECONDITION")
+            if not api_key:
+                return _google_error(401, "Missing client Vertex Express API key.", "UNAUTHENTICATED")
+            express_key = api_key
+        else:
+            _, express_key = selected_key
         headers["x-goog-api-key"] = express_key
         if project is None:
             try:
                 project = await discover_project_id(express_key)
             except Exception:
-                logger.exception("Could not discover the configured Vertex Express project")
+                logger.exception("Could not discover the Vertex Express project")
                 return _google_error(502, "Could not determine the Vertex Express project.", "UNAVAILABLE")
     else:
         project = project or credential_project
@@ -175,12 +181,18 @@ async def vertex_resource(
     project: str,
     location: str,
     resource: str,
+    api_key: str = Depends(get_vertex_api_key),
 ):
-    return await _forward_vertex(request, api_version, project, location)
+    return await _forward_vertex(request, api_version, project, location, api_key)
 
 
-async def vertex_publisher(request: Request, api_version: Literal["v1", "v1beta1"], resource: str):
-    return await _forward_vertex(request, api_version, None, None)
+async def vertex_publisher(
+    request: Request,
+    api_version: Literal["v1", "v1beta1"],
+    resource: str,
+    api_key: str = Depends(get_vertex_api_key),
+):
+    return await _forward_vertex(request, api_version, None, None, api_key)
 
 
 for path, endpoint, summary in (

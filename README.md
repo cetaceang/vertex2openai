@@ -36,8 +36,8 @@ The codebase is designed with modularity and maintainability in mind, located pr
 1.  **Create a Space:** On Hugging Face Spaces, create a new "Docker" SDK Space.
 2.  **Upload Files:** Add all project files ([`app/`](app/) directory, [`.gitignore`](.gitignore), [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`requirements.txt`](app/requirements.txt), etc.) to the repository.
 3.  **Configure Secrets:** In Space settings -> Secrets, add:
-    *   `API_KEY`: Your desired API key to protect this adapter service (required).
-    *   *Choose one credential method:*
+    *   `API_KEY` (Optional): Your desired API key to protect this adapter service.
+    *   *Choose one credential method, or leave authentication and credentials unset to use each client's Vertex Express key:*
         *   `GOOGLE_CREDENTIALS_JSON`: The **full content** of your Google Cloud service account JSON key file(s). Separate multiple keys with commas if providing more than one within this variable.
         *   Or provide individual files if your deployment setup supports mounting volumes (less common on standard HF Spaces).
     *   `VERTEX_EXPRESS_API_KEY` (Optional): Add your Vertex AI Express API key if you plan to use Express Mode.
@@ -52,7 +52,7 @@ The codebase is designed with modularity and maintainability in mind, located pr
 -   Docker and Docker Compose
 -   An external Docker network named `shared-net`. If it does not exist yet, create it with `docker network create shared-net`.
 -   Google Cloud Project with Vertex AI enabled.
--   Credentials: Either a Vertex AI Express API Key or one or more Service Account key files.
+-   Credentials: A server-side Vertex AI Express API key or Service Account key files, or a Vertex Express key supplied by each client.
 
 ### Credential Setup (Local)
 
@@ -64,8 +64,11 @@ Create your local configuration from the tracked [`.env.example`](.env.example):
 cp .env.example .env
 ```
 
-Edit `.env` to set `API_KEY` and choose a credential method below. Docker Compose
-reads these values and passes the settings shown in `.env.example` into the container.
+Edit `.env` to optionally set `API_KEY` and choose a credential method below.
+Leave `API_KEY`, `VERTEX_EXPRESS_API_KEY`, and `GOOGLE_CREDENTIALS_JSON` empty,
+with no service account files, to use each client's Vertex Express key instead.
+Docker Compose reads these values and passes the settings shown in `.env.example`
+into the container.
 
 1.  **Method 1: Vertex Express API Key**
     *   Set the [`VERTEX_EXPRESS_API_KEY`](app/config.py:0) environment variable.
@@ -96,7 +99,10 @@ is incompatible with httpx 0.28 and later.
 # Build from the local Dockerfile and start the service in detached mode
 docker compose up -d --build
 ```
-The service will typically be available at `http://localhost:8050` (check your [`docker-compose.yml`](docker-compose.yml)).
+Host port publishing is commented out by default. Other containers on `shared-net`
+can access the service at `http://vertex2openai:7860`. To access it from the host at
+`http://localhost:8050`, uncomment `ports` and `- "8050:7860"` in
+[`docker-compose.yml`](docker-compose.yml) before starting the service.
 
 ## API Usage
 
@@ -108,12 +114,23 @@ The service will typically be available at `http://localhost:8050` (check your [
 
 ### Authentication
 
-All requests to the adapter require an API key passed in the `Authorization` header:
+When `API_KEY` is set, requests require the configured adapter key in the
+`Authorization` header:
 
 ```
 Authorization: Bearer YOUR_API_KEY
 ```
 Replace `YOUR_API_KEY` with the value you set for the [`API_KEY`](app/config.py:0) environment variable.
+
+`API_KEY` defaults to empty, which disables adapter key validation. If neither
+`API_KEY` nor Hugging Face authentication is enabled and no server-side Express
+keys or service account credentials are loaded, pass your **Vertex Express API
+key** in `Authorization: Bearer YOUR_VERTEX_KEY`. That key is used only for the
+current request. Chat requests accept ordinary model IDs (such as
+`gemini-2.5-flash`) or `[EXPRESS]` model IDs and their supported suffixes;
+`/v1/models` lists Express models when a client key is supplied. Requests requiring
+an upstream key return `401` if the client omits it. Configured server credentials
+continue to take priority, and Hugging Face authentication keeps its existing behavior.
 
 ### Example Request (`curl`)
 
@@ -139,8 +156,9 @@ curl -X POST http://localhost:8050/v1/chat/completions \
 The native endpoints forward request bodies, response bodies, SSE data, upstream
 status codes, and end-to-end headers without converting them to OpenAI format or
 validating them through the Gemini SDK. Tool schemas, thought signatures, and new
-Google fields pass through unchanged. Authentication is replaced with the
-server's configured Google credentials; transport headers such as `Host` and
+Google fields pass through unchanged. Authentication uses the server's configured
+Google credentials or, in client-key passthrough mode, the client's Vertex
+Express key; transport headers such as `Host` and
 `Transfer-Encoding` are managed by the proxy.
 
 Both `v1` and `v1beta1` support `GET`, `POST`, and `HEAD` on these paths:
@@ -162,8 +180,10 @@ Resources include `models/{model}:generateContent`,
 `models/{model}:streamGenerateContent`, `models/{model}:countTokens`, and other
 Google publisher model methods. Authenticate with this adapter's `API_KEY` using
 `Authorization: Bearer ...` or `x-goog-api-key: ...`. A `key` query parameter is
-also accepted for native clients; ingress credentials are removed before the
-request is forwarded to Google. Existing Hugging Face authentication still
+also accepted for native clients. In client-key passthrough mode, these same
+inputs carry the client's Vertex Express key, which is forwarded to Google as
+`x-goog-api-key`. Credential query parameters are removed from the forwarded URL.
+Existing Hugging Face authentication still
 requires `x-ip-token` when enabled.
 
 For an Express deployment:
@@ -194,12 +214,13 @@ The application selects credentials in this order:
     *   The [`CredentialManager`](app/credentials_manager.py) loads credentials first from the [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) environment variable (if set).
     *   If [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) is *not* set, it loads credentials from `.json` files within the [`CREDENTIALS_DIR`](app/config.py:0).
     *   If [`ROUNDROBIN`](app/config.py:0) is enabled (`true`), requests using Service Accounts will cycle through the loaded credentials. Otherwise, it typically uses the first valid credential found.
+3.  **Client Key Passthrough:** When adapter authentication is disabled and no server credentials are loaded, use the client's Vertex Express key for that request.
 
 ## Key Environment Variables
 
 Managed in [`app/config.py`](app/config.py) and loaded from the environment:
 
--   `API_KEY`: **Required.** Secret key to authenticate requests *to this adapter*.
+-   `API_KEY`: Optional. Secret key to authenticate requests *to this adapter*. Unset or empty disables adapter key validation; there is no default password.
 -   `VERTEX_EXPRESS_API_KEY`: Optional. Your Vertex AI Express API key for simplified authentication.
 -   `VERTEX_EXPRESS_LOCATION`: Optional. Region for all Vertex Express model requests, including OpenAI Direct variants. Uses the global endpoint for `global` and a regional endpoint for other values (e.g. `us-central1`). Unset or blank values default to `global`.
 -   `GOOGLE_CREDENTIALS_JSON`: Optional. String containing the JSON content of one or more service account keys (comma-separated for multiple). Takes precedence over `CREDENTIALS_DIR` for service accounts.

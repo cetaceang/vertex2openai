@@ -1,10 +1,7 @@
 import os
 
-# Default password if not set in environment
-DEFAULT_PASSWORD = "123456"
-
-# Get password from environment variable or use default
-API_KEY = os.environ.get("API_KEY", DEFAULT_PASSWORD)
+# Optional key used to authenticate clients with this adapter.
+API_KEY = os.environ.get("API_KEY", "")
 
 # HuggingFace Authentication Settings
 HUGGINGFACE = os.environ.get("HUGGINGFACE", "false").lower() == "true"

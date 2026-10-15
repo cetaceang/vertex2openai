@@ -10,7 +10,8 @@ from google import genai
 # Local module imports
 import config as app_config
 from models import OpenAIRequest
-from auth import get_api_key
+from auth import client_key_passthrough_enabled, get_api_key
+from express_key_manager import ExpressKeyManager
 from message_processing import (
     create_gemini_prompt,
     create_encrypted_gemini_prompt,
@@ -31,6 +32,14 @@ router = APIRouter()
 async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
     try:
         credential_manager_instance = fastapi_request.app.state.credential_manager
+        express_key_manager_instance = fastapi_request.app.state.express_key_manager
+        use_client_key = client_key_passthrough_enabled(credential_manager_instance, express_key_manager_instance)
+        if use_client_key:
+            if not api_key:
+                return JSONResponse(status_code=401, content=create_openai_error_response(
+                    401, "Missing client Vertex Express API key. Use 'Authorization: Bearer YOUR_VERTEX_KEY'.", "authentication_error"
+                ))
+            express_key_manager_instance = ExpressKeyManager(keys=[api_key])
         OPENAI_DIRECT_SUFFIX = "-openai"
         OPENAI_SEARCH_SUFFIX = "-openaisearch"
         EXPERIMENTAL_MARKER = "-exp-"
@@ -50,7 +59,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
             suffix_to_remove = OPENAI_SEARCH_SUFFIX if is_openai_search_model else OPENAI_DIRECT_SUFFIX
             temp_name_for_marker_check = request.model[:-len(suffix_to_remove)]
             # An OpenAI model can be prefixed with PAY, EXPRESS, or contain EXP
-            if temp_name_for_marker_check.startswith(PAY_PREFIX) or \
+            if use_client_key or temp_name_for_marker_check.startswith(PAY_PREFIX) or \
                temp_name_for_marker_check.startswith(EXPRESS_PREFIX) or \
                EXPERIMENTAL_MARKER in temp_name_for_marker_check:
                 is_openai_direct_model = True
@@ -67,7 +76,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         # Determine base_model_name by stripping known prefixes and suffixes
         # Order of stripping: Prefixes first, then suffixes.
         
-        is_express_model_request = False
+        is_express_model_request = use_client_key
         if base_model_name.startswith(EXPRESS_PREFIX):
             is_express_model_request = True
             base_model_name = base_model_name[len(EXPRESS_PREFIX):]
@@ -114,12 +123,16 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
             gen_config_dict["thinking_config"]["include_thoughts"] = False
 
         client_to_use = None
-        express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
-        # This client initialization logic is for Gemini models (i.e., non-OpenAI Direct models).
-        # If 'is_openai_direct_model' is true, this section will be skipped, and the
-        # dedicated 'if is_openai_direct_model:' block later will handle it.
-        if is_express_model_request: # Changed from elif to if
+        if is_openai_direct_model:
+            if is_express_model_request:
+                openai_handler = OpenAIDirectHandler(express_key_manager=express_key_manager_instance)
+                return await openai_handler.process_request(request, base_model_name, is_express=True, is_openai_search=is_openai_search_model)
+            openai_handler = OpenAIDirectHandler(credential_manager=credential_manager_instance)
+            return await openai_handler.process_request(request, base_model_name, is_openai_search=is_openai_search_model)
+
+        # OpenAI Direct requests have returned above; initialize the Gemini client.
+        if is_express_model_request:
             if express_key_manager_instance.get_total_keys() == 0:
                 error_msg = f"Model '{request.model}' is an Express model and requires an Express API key, but none are configured."
                 print(f"ERROR: {error_msg}")
@@ -178,25 +191,15 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 print(f"ERROR: {error_msg}")
                 return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
 
-        # If we reach here and client_to_use is still None, it means it's an OpenAI Direct Model,
-        # which handles its own client and responses.
-        # For Gemini models (Express or SA), client_to_use must be set, or an error returned above.
-        if not is_openai_direct_model and client_to_use is None:
+        # Gemini requests must have initialized a client or returned an error above.
+        if client_to_use is None:
              # This case should ideally not be reached if the logic above is correct,
              # as each path (Express/SA for Gemini) should either set client_to_use or return an error.
              # This is a safeguard.
             print(f"CRITICAL ERROR: Client for Gemini model '{request.model}' was not initialized, and no specific error was returned. This indicates a logic flaw.")
             return JSONResponse(status_code=500, content=create_openai_error_response(500, "Critical internal server error: Gemini client not initialized.", "server_error"))
 
-        if is_openai_direct_model:
-            # Use the new OpenAI handler
-            if is_express_model_request:
-                openai_handler = OpenAIDirectHandler(express_key_manager=express_key_manager_instance)
-                return await openai_handler.process_request(request, base_model_name, is_express=True, is_openai_search=is_openai_search_model)
-            else:
-                openai_handler = OpenAIDirectHandler(credential_manager=credential_manager_instance)
-                return await openai_handler.process_request(request, base_model_name, is_openai_search=is_openai_search_model)
-        elif is_auto_model:
+        if is_auto_model:
             print(f"Processing auto model: {request.model}")
             attempts = [
                 {"name": "base", "model": base_model_name, "prompt_func": create_gemini_prompt, "config_modifier": lambda c: c},

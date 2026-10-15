@@ -43,7 +43,9 @@ def fake_client(stream):
 def app_for_client(client):
     app = FastAPI()
     app.include_router(chat_router)
-    app.state.credential_manager = SimpleNamespace(get_credentials=lambda: (object(), "test-project"))
+    app.state.credential_manager = SimpleNamespace(
+        get_credentials=lambda: (object(), "test-project"), get_total_credentials=lambda: 1,
+    )
     app.state.express_key_manager = SimpleNamespace(get_total_keys=lambda: 0)
     app.dependency_overrides[get_api_key] = lambda: "test"
     return app

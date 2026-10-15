@@ -44,7 +44,10 @@ class VertexPassthroughTests(unittest.IsolatedAsyncioTestCase):
         self.app = FastAPI()
         self.app.include_router(vertex_api.router)
         self.credentials = Credentials()
-        self.credential_manager = SimpleNamespace(get_credentials=Mock(return_value=(self.credentials, "credential-project")))
+        self.credential_manager = SimpleNamespace(
+            get_credentials=Mock(return_value=(self.credentials, "credential-project")),
+            get_total_credentials=Mock(return_value=1),
+        )
         self.express_manager = SimpleNamespace(get_total_keys=Mock(return_value=0), get_express_api_key=Mock(return_value=None))
         self.app.state.credential_manager = self.credential_manager
         self.app.state.express_key_manager = self.express_manager
@@ -160,6 +163,81 @@ class VertexPassthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/projects/specified/locations/global/", self.requests[0].url.path)
         self.assertEqual(self.requests[0].headers["x-goog-api-key"], "google-express-key")
         discover.assert_not_awaited()
+
+    async def test_client_key_passthrough_accepts_each_native_auth_input(self):
+        self.credential_manager.get_credentials.return_value = (None, None)
+        self.credential_manager.get_total_credentials.return_value = 0
+
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response()
+
+        for headers, query, key in (
+            ({"Authorization": "Bearer client-a"}, "alt=sse", "client-a"),
+            ({"x-goog-api-key": "client-b"}, "alt=sse", "client-b"),
+            ({}, "%6Bey=client-c&alt=sse", "client-c"),
+        ):
+            with self.subTest(key=key), patch("auth.API_KEY", ""), \
+                 patch.object(vertex_api, "_new_http_client", self.factory(handle)):
+                response = await self.send(
+                    f"/v1/projects/client-project/locations/us-central1/publishers/google/models/model:generateContent?{query}",
+                    headers=headers,
+                )
+
+            self.assertEqual(response.status_code, 200)
+            sent = self.requests[-1]
+            self.assertEqual(sent.headers["x-goog-api-key"], key)
+            self.assertNotIn("authorization", sent.headers)
+            self.assertEqual(sent.url.query, b"alt=sse")
+            self.assertIn("/projects/client-project/locations/us-central1/", sent.url.path)
+
+        self.assertEqual(self.express_manager.get_total_keys(), 0)
+
+    async def test_client_key_short_path_discovers_its_own_project(self):
+        self.credential_manager.get_credentials.return_value = (None, None)
+        self.credential_manager.get_total_credentials.return_value = 0
+
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response()
+
+        with patch("auth.API_KEY", ""), \
+             patch.object(vertex_api, "_new_http_client", self.factory(handle)), \
+             patch.object(vertex_api, "discover_project_id", AsyncMock(return_value="client-project")) as discover:
+            response = await self.send("/v1/publishers/google/models/model:countTokens", headers={"x-goog-api-key": "client-key"})
+
+        self.assertEqual(response.status_code, 200)
+        discover.assert_awaited_once_with("client-key")
+        self.assertIn("/projects/client-project/locations/global/", self.requests[0].url.path)
+        self.assertEqual(self.requests[0].headers["x-goog-api-key"], "client-key")
+
+    async def test_client_key_passthrough_requires_a_key_on_every_request(self):
+        self.credential_manager.get_credentials.return_value = (None, None)
+        self.credential_manager.get_total_credentials.return_value = 0
+        with patch("auth.API_KEY", ""), patch.object(vertex_api, "_new_http_client") as factory:
+            response = await self.send("/v1/publishers/google/models/model:generateContent", headers={})
+
+        self.assertEqual(response.status_code, 401)
+        factory.assert_not_called()
+
+    async def test_configured_credentials_take_priority_without_adapter_auth(self):
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response()
+
+        with patch("auth.API_KEY", ""), patch.object(vertex_api, "_new_http_client", self.factory(handle)):
+            response = await self.send("/v1/publishers/google/models/model:generateContent", headers={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.requests[-1].headers["authorization"], "Bearer google-token")
+
+        self.express_manager.get_total_keys.return_value = 1
+        self.express_manager.get_express_api_key.return_value = (0, "server-key")
+        with patch("auth.API_KEY", ""), \
+             patch.object(vertex_api, "_new_http_client", self.factory(handle)), \
+             patch.object(vertex_api, "discover_project_id", AsyncMock(return_value="server-project")):
+            response = await self.send("/v1/publishers/google/models/model:generateContent", headers={"x-goog-api-key": "client-key"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.requests[-1].headers["x-goog-api-key"], "server-key")
 
     async def test_short_path_uses_service_account_project_when_no_express_key_exists(self):
         def handle(request):
