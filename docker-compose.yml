@@ -15,6 +15,8 @@ services:
       # Vertex Express API key and region (default: global)
       - VERTEX_EXPRESS_API_KEY=${VERTEX_EXPRESS_API_KEY:-}
       - VERTEX_EXPRESS_LOCATION=${VERTEX_EXPRESS_LOCATION:-global}
+      # Optional upstream proxy URL (HTTP or SOCKS), read from the shell or .env
+      - PROXY_URL=${PROXY_URL:-}
       # Enable/disable fake streaming (default: false)
       - FAKE_STREAMING=false
       # Interval for fake streaming keep-alive messages (default: 1.0)
