@@ -58,6 +58,15 @@ The codebase is designed with modularity and maintainability in mind, located pr
 
 Manage environment variables using a [`.env`](.env) file in the project root (ignored by git) or within your [`docker-compose.yml`](docker-compose.yml).
 
+Create your local configuration from the tracked [`.env.example`](.env.example):
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to set `API_KEY` and choose a credential method below. Docker Compose
+reads these values and passes the settings shown in `.env.example` into the container.
+
 1.  **Method 1: Vertex Express API Key**
     *   Set the [`VERTEX_EXPRESS_API_KEY`](app/config.py:0) environment variable.
     *   Optionally set `VERTEX_EXPRESS_LOCATION` to route all Express models and variants (including `-openai` and `-openaisearch`) to one region. The default is `global`; regional values such as `us-central1` use the corresponding regional endpoint. Docker Compose passes both variables from your shell or `.env` file into the container.
@@ -69,25 +78,17 @@ Manage environment variables using a [`.env`](.env) file in the project root (ig
     *   Place your service account `.json` key files inside this directory.
     *   Mount this directory to `/app/credentials` in the container (as shown in the default [`docker-compose.yml`](docker-compose.yml)). The service will use files found in the directory specified by [`CREDENTIALS_DIR`](app/config.py:0) (defaults to `/app/credentials`).
 
-### Environment Variables (`.env` file example)
+### Environment Variables
 
-```env
-API_KEY="your_secure_api_key_here" # REQUIRED: Set a strong key for security
+See [`.env.example`](.env.example) for credential, proxy, credential rotation, and
+streaming settings. Leave `PROXY_URL` empty for direct connections, or set it to an
+HTTP or SOCKS proxy address reachable from the container. Inside the container,
+`127.0.0.1` refers to the container itself.
 
-# --- Choose *ONE* primary credential method ---
-# VERTEX_EXPRESS_API_KEY="your_vertex_express_key"          # Option 1: Express Key
-# GOOGLE_CREDENTIALS_JSON='{"type": ...}{"type": ...}' # Option 2: JSON content (comma-separate multiple keys)
-# CREDENTIALS_DIR="/app/credentials"                      # Option 3: Directory path (Default if GOOGLE_CREDENTIALS_JSON is unset, ensure volume mount in docker-compose)
-# ---
-
-# --- Optional Settings ---
-# VERTEX_EXPRESS_LOCATION="global" # Region for all Express models (e.g. us-central1)
-# ROUNDROBIN="true"              # Enable round-robin for Service Accounts (Method 2 or 3)
-# FAKE_STREAMING="false"         # For debugging - simulate streaming
-# FAKE_STREAMING_INTERVAL="1.0"  # Interval for fake streaming keep-alives
-# GCP_PROJECT_ID="your-gcp-project-id" # Explicitly set GCP Project ID if needed
-# GCP_LOCATION="us-central1"          # Explicitly set GCP Location if needed
-```
+Proxy support currently varies by endpoint: native Vertex passthrough uses
+`PROXY_URL`, while ordinary Gemini SDK chat requests do not explicitly pass it to
+the SDK. OpenAI Direct mode still uses the legacy httpx `proxies` argument, which
+is incompatible with httpx 0.28 and later.
 
 ### Running Locally
 
@@ -204,8 +205,7 @@ Managed in [`app/config.py`](app/config.py) and loaded from the environment:
 -   `GOOGLE_CREDENTIALS_JSON`: Optional. String containing the JSON content of one or more service account keys (comma-separated for multiple). Takes precedence over `CREDENTIALS_DIR` for service accounts.
 -   `CREDENTIALS_DIR`: Optional. Path *within the container* where service account `.json` files are located. Used only if `GOOGLE_CREDENTIALS_JSON` is not set. (Default: `/app/credentials`)
 -   `ROUNDROBIN`: Optional. Set to `"true"` to enable round-robin selection among loaded Service Account credentials. (Default: `"false"`)
--   `GCP_PROJECT_ID`: Optional. Explicitly set the Google Cloud Project ID. If not set, attempts to infer from credentials.
--   `GCP_LOCATION`: Optional. Explicitly set the Google Cloud Location (region). If not set, attempts to infer or uses Vertex AI defaults.
+-   `PROXY_URL`: Optional. Upstream HTTP or SOCKS proxy URL. Leave unset or empty for direct connections; see the endpoint limitations above.
 -   `FAKE_STREAMING`: Optional. Set to `"true"` to simulate streaming output for testing. (Default: `"false"`)
 -   `FAKE_STREAMING_INTERVAL`: Optional. Interval (seconds) for keep-alive messages during fake streaming. (Default: `1.0`)
 

@@ -11,16 +11,20 @@ services:
       # Directory where credential files are stored (used by credential manager)
       - CREDENTIALS_DIR=/app/credentials
       # API key for authentication (default: 123456)
-      - API_KEY=123456
+      - API_KEY=${API_KEY:-123456}
       # Vertex Express API key and region (default: global)
       - VERTEX_EXPRESS_API_KEY=${VERTEX_EXPRESS_API_KEY:-}
       - VERTEX_EXPRESS_LOCATION=${VERTEX_EXPRESS_LOCATION:-global}
+      # Optional service account JSON; leave empty to use the credentials volume
+      - GOOGLE_CREDENTIALS_JSON=${GOOGLE_CREDENTIALS_JSON:-}
+      # Rotate service account credentials when multiple accounts are configured
+      - ROUNDROBIN=${ROUNDROBIN:-false}
       # Optional upstream proxy URL (HTTP or SOCKS), read from the shell or .env
       - PROXY_URL=${PROXY_URL:-}
       # Enable/disable fake streaming (default: false)
-      - FAKE_STREAMING=false
+      - FAKE_STREAMING=${FAKE_STREAMING:-false}
       # Interval for fake streaming keep-alive messages (default: 1.0)
-      - FAKE_STREAMING_INTERVAL=1.0
+      - FAKE_STREAMING_INTERVAL=${FAKE_STREAMING_INTERVAL:-1.0}
     networks:
       - shared-net
     restart: unless-stopped
