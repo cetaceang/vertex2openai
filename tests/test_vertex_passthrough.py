@@ -127,6 +127,50 @@ class VertexPassthroughTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.content, upstream_body)
                 self.assertEqual(int(sent.headers["content-length"]), len(sent.content))
 
+    async def test_percent_encoded_method_reaches_schema_compat(self):
+        body = b'{"tools":[{"functionDeclarations":[{"name":"cron","parameters":{"type":"OBJECT","properties":{"sessionKey":{}}}}]}]}'
+
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response()
+
+        with patch.object(vertex_api.app_config, "VERTEX_TOOL_SCHEMA_COMPAT", True), \
+             patch.object(vertex_api, "_new_http_client", self.factory(handle)):
+            await self.send("/v1/publishers/google/models/gemini-test%3AstreamGenerateContent?alt=sse", content=body)
+
+        declaration = json.loads(self.requests[-1].content)["tools"][0]["functionDeclarations"][0]
+        self.assertIn("parametersJsonSchema", declaration)
+        self.assertNotIn(b"%3AstreamGenerateContent", self.requests[-1].url.raw_path)
+
+    async def test_method_normalization_preserves_encoded_model_ids_and_queries(self):
+        body = b'{"tools":[{"functionDeclarations":[{"name":"cron","parameters":{"type":"OBJECT"}}]}]}'
+
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response()
+
+        prefixes = ("/v1/publishers/google/", "/v1beta1/projects/specified/locations/global/publishers/google/")
+        for enabled in (False, True):
+            for prefix in prefixes:
+                for separator in (":", "%3A", "%3a"):
+                    for method in ("generateContent", "streamGenerateContent", "countTokens"):
+                        with self.subTest(enabled=enabled, prefix=prefix, separator=separator, method=method), \
+                             patch.object(vertex_api.app_config, "VERTEX_TOOL_SCHEMA_COMPAT", enabled), \
+                             patch.object(vertex_api, "_new_http_client", self.factory(handle)):
+                            path = prefix + f"models/gemini-test%2Fvariant{separator}{method}?alt=sse&tag=a%2Fb&key=ingress-secret"
+                            await self.send(path, content=body)
+                            sent = self.requests[-1]
+                            self.assertTrue(sent.url.raw_path.split(b"?", 1)[0].endswith(
+                                f"models/gemini-test%2Fvariant:{method}".encode()))
+                            self.assertEqual(sent.url.query, b"alt=sse&tag=a%2Fb")
+                            declaration = json.loads(sent.content)["tools"][0]["functionDeclarations"][0]
+                            self.assertEqual("parametersJsonSchema" in declaration, enabled)
+                            if not enabled:
+                                self.assertEqual(sent.content, body)
+
+        for resource in (b"models/gemini%3Atest:generateContent", b"models/gemini%253AstreamGenerateContent"):
+            self.assertEqual(vertex_api._normalize_method_delimiter(resource), resource)
+
     async def test_compatibility_does_not_rewrite_encoded_or_other_method_bodies(self):
         body = b'{"tools":[{"functionDeclarations":[{"name":"cron","parameters":{"type":"OBJECT"}}]}]}'
 
@@ -307,6 +351,55 @@ class VertexPassthroughTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, status)
                 self.assertEqual(response.content, body)
                 self.assertEqual(response.headers["retry-after"], "5")
+
+    async def test_upstream_json_error_reason_is_redacted_and_wire_bytes_are_preserved(self):
+        body = json.dumps({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": (
+            "cron.sessionKey schema type is missing; adapter-secret google-token "
+            "https://example.invalid/?key=private-query-value&alt=sse Bearer private-bearer-value"
+        )}}).encode()
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                wire_body = gzip.compress(body) if compressed else body
+                headers = {"Retry-After": "5", "Content-Length": str(len(wire_body))}
+                if compressed:
+                    headers["Content-Encoding"] = "gzip"
+
+                def handle(request):
+                    return self.upstream_response(400, [wire_body[:13], wire_body[13:]], headers)
+
+                with patch.object(vertex_api, "_new_http_client", self.factory(handle)), \
+                     patch.object(vertex_api, "emit_diagnostic") as log:
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://adapter") as client:
+                        async with client.stream("POST", "/v1/publishers/google/models/model:generateContent",
+                                                 headers={"Authorization": "Bearer adapter-secret"}, content=b"{}") as response:
+                            raw = b"".join([data async for data in response.aiter_raw()])
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(raw, wire_body)
+                self.assertEqual(response.headers["retry-after"], "5")
+                details = next(call.kwargs for call in log.call_args_list if call.args == ("vertex_upstream_error",))
+                self.assertIn("cron.sessionKey schema type is missing", details["message"])
+                self.assertEqual(details["google_code"], 400)
+                self.assertEqual(details["google_status"], "INVALID_ARGUMENT")
+                self.assertFalse(details["body_truncated"])
+                for secret in ("adapter-secret", "google-token", "private-query-value", "private-bearer-value"):
+                    self.assertNotIn(secret, str(log.call_args_list))
+
+    async def test_non_json_upstream_errors_have_bounded_diagnostics_without_content_type(self):
+        body = b"<html><title>400 Bad Request</title><body>" + b"invalid route " * 1000 + b"</body></html>"
+
+        def handle(request):
+            return self.upstream_response(400, [body])
+
+        with patch.object(vertex_api, "_new_http_client", self.factory(handle)), \
+             patch.object(vertex_api, "emit_diagnostic") as log:
+            response = await self.send("/v1/publishers/google/models/model:generateContent")
+        self.assertEqual(response.content, body)
+        details = next(call.kwargs for call in log.call_args_list if call.args == ("vertex_upstream_error",))
+        self.assertEqual(details["error_format"], "text")
+        self.assertTrue(details["body_truncated"])
+        self.assertIn("400 Bad Request", details["message"])
+        self.assertNotIn("<html>", details["message"])
+        self.assertLessEqual(len(details["message"]), 1536)
 
     async def test_hop_headers_are_removed_and_duplicate_end_to_end_headers_survive(self):
         def handle(request):

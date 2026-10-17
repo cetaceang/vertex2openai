@@ -185,6 +185,13 @@ inputs carry the client's Vertex Express key, which is forwarded to Google as
 Existing Hugging Face authentication still
 requires `x-ip-token` when enabled.
 
+URL-encoded custom method delimiters such as `%3AstreamGenerateContent` are
+normalized to `:streamGenerateContent` before upstream routing and tool schema
+compatibility checks. Other escapes in model IDs and query parameters are
+preserved. Uvicorn also displays literal colons as `%3A` in access logs, so
+that spelling in an access log alone does not establish how the client encoded
+the original path.
+
 For an Express deployment:
 
 ```bash
@@ -219,6 +226,15 @@ Chat and native requests now emit `stream_trace` lifecycle logs with a shared
 of tools. `end` records SSE text/reasoning character counts, tool-call counts, finish
 reasons, `[DONE]`, and whether this server completed its ASGI response. These
 logs omit prompts, generated text, tool arguments, and credentials.
+
+Native `vertex_request` records whether schema compatibility is enabled, how
+many declarations were migrated, and whether an encoded method delimiter was
+normalized. For HTTP errors, `vertex_upstream_error` also records Google's
+error code/status and a limited error message, including text errors without
+`Content-Type`. Only a bounded error-body prefix is inspected; selected
+credentials and credential query values are redacted. Native response bytes,
+headers, and status codes stay unchanged. Uvicorn access logs redact credential
+query values as well.
 
 - `complete`: this server finished sending the response to its HTTP transport.
 - `downstream_disconnected`: the immediate client (New API in a relayed request)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
 import sys
 import unittest
@@ -12,12 +13,25 @@ from fastapi.responses import StreamingResponse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from diagnose_stream import probe_stream
-from stream_diagnostics import SSEInspector, StreamDiagnosticsMiddleware
+from stream_diagnostics import CredentialQueryFilter, SSEInspector, StreamDiagnosticsMiddleware
 
 
 def event(delta=None, finish=None):
     return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}]},
                                 ensure_ascii=False) + "\n\n"
+
+
+class AccessLogRedactionTests(unittest.TestCase):
+    def test_uvicorn_query_credentials_are_redacted_without_changing_other_fields(self):
+        path = "/v1/publishers/google/models/test%3AstreamGenerateContent?alt=sse&key=private-a&%61ccess_token=private-b&tag=a%2Fb"
+        record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                                   ("client", "POST", path, "1.1", 400), None)
+        self.assertTrue(CredentialQueryFilter().filter(record))
+        self.assertNotIn("private-a", record.getMessage())
+        self.assertNotIn("private-b", record.getMessage())
+        self.assertIn("alt=sse&key=[REDACTED]&%61ccess_token=[REDACTED]&tag=a%2Fb", record.getMessage())
+        self.assertEqual(record.args[:2], ("client", "POST"))
+        self.assertEqual(record.args[3:], ("1.1", 400))
 
 
 class SSEInspectorTests(unittest.TestCase):

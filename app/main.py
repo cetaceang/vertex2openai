@@ -6,7 +6,7 @@ from auth import client_key_passthrough_enabled
 from credentials_manager import CredentialManager
 from express_key_manager import ExpressKeyManager
 from vertex_ai_init import init_vertex_ai
-from stream_diagnostics import StreamDiagnosticsMiddleware
+from stream_diagnostics import StreamDiagnosticsMiddleware, install_access_log_redaction
 
 # Routers
 from routes import models_api
@@ -14,6 +14,7 @@ from routes import chat_api
 from routes import vertex_api
 
 app = FastAPI(title="OpenAI to Gemini Adapter")
+install_access_log_redaction()
 app.add_middleware(StreamDiagnosticsMiddleware)
 
 app.add_middleware(

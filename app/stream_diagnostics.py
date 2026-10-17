@@ -2,8 +2,46 @@
 
 import codecs
 import json
+import logging
+import re
 import time
+from urllib.parse import quote, unquote_plus
 from uuid import uuid4
+
+
+_CREDENTIAL_QUERY_NAMES = {"key", "access_token", "oauth_token", "api_key", "x-goog-api-key", "x-ip-token"}
+_QUERY_PARAMETER = re.compile(r"([?&])([^=&#\s]+)=([^&#\s]*)")
+
+
+def redact_query_credentials(value):
+    def replace(match):
+        if unquote_plus(match[2]).lower() in _CREDENTIAL_QUERY_NAMES:
+            return f"{match[1]}{match[2]}=[REDACTED]"
+        return match[0]
+    return _QUERY_PARAMETER.sub(replace, value)
+
+
+def redact_error_message(message, secrets=()):
+    for secret in sorted({value for value in secrets if isinstance(value, str) and value}, key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]").replace(quote(secret, safe=""), "[REDACTED]")
+    message = re.sub(r"(?i)\bBearer\s+[^\s\"<>]+", "Bearer [REDACTED]", message)
+    return redact_query_credentials(message)[:1536]
+
+
+class CredentialQueryFilter(logging.Filter):
+    def filter(self, record):
+        # Uvicorn access records use (client, method, path, version, status).
+        if isinstance(record.args, tuple) and len(record.args) == 5 and isinstance(record.args[2], str):
+            args = list(record.args)
+            args[2] = redact_query_credentials(args[2])
+            record.args = tuple(args)
+        return True
+
+
+def install_access_log_redaction():
+    logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, CredentialQueryFilter) for item in logger.filters):
+        logger.addFilter(CredentialQueryFilter())
 
 
 class SSEInspector:
