@@ -26,11 +26,15 @@ from api_helpers import (
 )
 from openai_handler import OpenAIDirectHandler
 from project_id_discovery import discover_project_id
+from stream_diagnostics import emit_diagnostic
 
 router = APIRouter()
 
 @router.post("/v1/chat/completions")
 async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
+    emit_diagnostic("chat_request", request_id=getattr(fastapi_request.state, "stream_diagnostic_id", None),
+                    model=request.model, stream=bool(request.stream),
+                    fake_streaming=app_config.FAKE_STREAMING_ENABLED, tools=len(request.tools or []))
     try:
         credential_manager_instance = fastapi_request.app.state.credential_manager
         express_key_manager_instance = fastapi_request.app.state.express_key_manager

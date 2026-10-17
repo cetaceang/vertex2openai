@@ -1,4 +1,5 @@
 import gzip
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -100,6 +101,47 @@ class VertexPassthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["x-request-id"], "vertex-id")
         self.assertTrue(self.clients[0].is_closed)
         self.assertTrue(self.streams[0].closed)
+
+    async def test_tool_schema_migration_is_opt_in_and_preserves_response(self):
+        body = b'{ "tools": [{"functionDeclarations": [{"name": "cron", "parameters": {"type": "OBJECT", "properties": {"sessionKey": {}}}}]}] }\n'
+        upstream_body = b'{ "originalVertexResponse": true }\n'
+
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response(chunks=[upstream_body], headers={"Content-Type": "application/json"})
+
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), \
+                 patch.object(vertex_api.app_config, "VERTEX_TOOL_SCHEMA_COMPAT", enabled), \
+                 patch.object(vertex_api, "_new_http_client", self.factory(handle)):
+                response = await self.send("/v1/publishers/google/models/model:generateContent", content=body,
+                                           headers={"Authorization": "Bearer adapter-secret", "Content-MD5": "stale"})
+                sent = self.requests[-1]
+                if enabled:
+                    declaration = json.loads(sent.content)["tools"][0]["functionDeclarations"][0]
+                    self.assertEqual(declaration["parametersJsonSchema"], {"type": "object", "properties": {"sessionKey": {}}})
+                    self.assertNotIn("parameters", declaration)
+                    self.assertNotIn("content-md5", sent.headers)
+                else:
+                    self.assertEqual(sent.content, body)
+                self.assertEqual(response.content, upstream_body)
+                self.assertEqual(int(sent.headers["content-length"]), len(sent.content))
+
+    async def test_compatibility_does_not_rewrite_encoded_or_other_method_bodies(self):
+        body = b'{"tools":[{"functionDeclarations":[{"name":"cron","parameters":{"type":"OBJECT"}}]}]}'
+
+        def handle(request):
+            self.requests.append(request)
+            return self.upstream_response()
+
+        with patch.object(vertex_api.app_config, "VERTEX_TOOL_SCHEMA_COMPAT", True), \
+             patch.object(vertex_api, "_new_http_client", self.factory(handle)):
+            await self.send("/v1/publishers/google/models/model:otherMethod", content=body)
+            compressed = gzip.compress(body)
+            await self.send("/v1/publishers/google/models/model:generateContent", content=compressed,
+                            headers={"Authorization": "Bearer adapter-secret", "Content-Encoding": "gzip"})
+        self.assertEqual(self.requests[-2].content, body)
+        self.assertEqual(self.requests[-1].content, compressed)
 
     async def test_native_google_auth_headers_and_query_use_the_adapter_key(self):
         for headers, query in (

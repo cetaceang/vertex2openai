@@ -15,6 +15,8 @@ services:
       # Vertex Express API key and region (default: global)
       - VERTEX_EXPRESS_API_KEY=${VERTEX_EXPRESS_API_KEY:-}
       - VERTEX_EXPRESS_LOCATION=${VERTEX_EXPRESS_LOCATION:-global}
+      # Optional native Vertex tool schema compatibility (strict passthrough by default)
+      - VERTEX_TOOL_SCHEMA_COMPAT=${VERTEX_TOOL_SCHEMA_COMPAT:-false}
       # Optional service account JSON; leave empty to use the credentials volume
       - GOOGLE_CREDENTIALS_JSON=${GOOGLE_CREDENTIALS_JSON:-}
       # Rotate service account credentials when multiple accounts are configured

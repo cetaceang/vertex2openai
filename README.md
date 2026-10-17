@@ -155,7 +155,7 @@ curl -X POST http://localhost:8050/v1/chat/completions \
 The native endpoints forward request bodies, response bodies, SSE data, upstream
 status codes, and end-to-end headers without converting them to OpenAI format or
 validating them through the Gemini SDK. Tool schemas, thought signatures, and new
-Google fields pass through unchanged. Authentication uses the server's configured
+Google fields pass through unchanged by default. Authentication uses the server's configured
 Google credentials or, in client-key passthrough mode, the client's Vertex
 Express key; transport headers such as `Host` and
 `Transfer-Encoding` are managed by the proxy.
@@ -200,6 +200,66 @@ with the same headers and body. Native responses keep Google's format and must
 be consumed by a Vertex-compatible client. OpenAI-compatible clients continue
 to use `/v1/chat/completions`.
 
+If a native client gets a `functionDeclaration` error about a missing schema
+`type` (for example, a `cron` tool's nullable `sessionKey`), set
+`VERTEX_TOOL_SCHEMA_COMPAT=true` in `.env` and recreate the container. This opt-in
+mode moves tool input `parameters` to `parametersJsonSchema`, converts Vertex
+type names such as `OBJECT` to JSON Schema's `object`, and preserves unions and
+unconstrained schemas such as `{}`. It does not guess missing types. Existing
+`parametersJsonSchema` fields, messages, thought signatures, and response bytes
+are preserved. Only uncompressed JSON bodies for `generateContent`,
+`streamGenerateContent`, and `countTokens` are eligible. Leave this option off
+for strict request-body passthrough. The OpenAI-compatible endpoint already uses
+JSON Schema for tool parameters and does not need this option.
+
+### Diagnosing OpenClaw / New API connection failures
+
+Chat and native requests now emit `stream_trace` lifecycle logs with a shared
+`request_id`. `chat_request` records `stream`, `fake_streaming`, and the number
+of tools. `end` records SSE text/reasoning character counts, tool-call counts, finish
+reasons, `[DONE]`, and whether this server completed its ASGI response. These
+logs omit prompts, generated text, tool arguments, and credentials.
+
+- `complete`: this server finished sending the response to its HTTP transport.
+- `downstream_disconnected`: the immediate client (New API in a relayed request)
+  disconnected before the response completed; this does not identify who caused
+  the original failure.
+- `upstream_error`: the SSE body contained an error payload.
+- `http_error`: the request returned HTTP `4xx` or `5xx`.
+- `incomplete_sse`: an OpenAI SSE response ended without `[DONE]` or a finish reason.
+- `interrupted`: response handling stopped before completion; inspect `error_type`.
+
+HTTP `200`, token usage, and even a completed ASGI response do not establish
+that OpenClaw received the complete response through every relay.
+
+Rebuild after pulling code; the Compose deployment copies application files
+into the image rather than mounting the source directory:
+
+```bash
+git pull --ff-only
+docker compose up -d --build
+```
+
+Run the bundled probe directly against the adapter from inside its container:
+
+```bash
+docker exec vertex2openai python diagnose_stream.py --model '[EXPRESS] gemini-3.7-flash'
+docker exec vertex2openai python diagnose_stream.py --model '[EXPRESS] gemini-3.7-flash' --tools
+```
+
+The probe uses the container's `API_KEY` (or its first Vertex Express key when
+no adapter key is configured). It prints only a stream summary and exits with
+code `0` when the expected text/tool output, finish reason, and `[DONE]` arrive
+without protocol or connection errors. These small tests do not replay a full
+OpenClaw conversation.
+
+To test through New API, use `--base-url http://NEW_API_HOST:PORT/v1`, the model
+ID configured there, and `--api-key-env DIAGNOSTIC_API_KEY`. Supply that
+environment variable using your usual secret management; the probe never
+prints it. Compare direct and relayed results, then reproduce the OpenClaw
+request and inspect its `stream_trace` `end` record. A direct success with a
+relayed failure narrows the investigation to the additional relay path.
+
 For streaming requests, HTTP `200` indicates that the stream has started. Check
 the stream body and server error logs when a client receives no usable reply;
 errors after streaming starts cannot change the HTTP status code.
@@ -236,6 +296,7 @@ Managed in [`app/config.py`](app/config.py) and loaded from the environment:
 -   `API_KEY`: Optional. Secret key to authenticate requests *to this adapter*. Unset or empty disables adapter key validation; there is no default password.
 -   `VERTEX_EXPRESS_API_KEY`: Optional. Your Vertex AI Express API key for simplified authentication.
 -   `VERTEX_EXPRESS_LOCATION`: Optional. Region for all Vertex Express model requests, including OpenAI Direct variants. Uses the global endpoint for `global` and a regional endpoint for other values (e.g. `us-central1`). Unset or blank values default to `global`.
+-   `VERTEX_TOOL_SCHEMA_COMPAT`: Optional. Set to `"true"` to migrate native Vertex tool input schemas to `parametersJsonSchema`. Defaults to `"false"` for strict passthrough. See the native endpoint notes above.
 -   `GOOGLE_CREDENTIALS_JSON`: Optional. String containing the JSON content of one or more service account keys (comma-separated for multiple). Takes precedence over `CREDENTIALS_DIR` for service accounts.
 -   `CREDENTIALS_DIR`: Optional. Path *within the container* where service account `.json` files are located. Used only if `GOOGLE_CREDENTIALS_JSON` is not set. (Default: `/app/credentials`)
 -   `ROUNDROBIN`: Optional. Set to `"true"` to enable round-robin selection among loaded Service Account credentials. (Default: `"false"`)

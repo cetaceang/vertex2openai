@@ -18,6 +18,7 @@ from auth import get_api_key
 from message_processing import GeminiStreamState, convert_chunk_to_openai
 from models import OpenAIRequest
 from routes.chat_api import router as chat_router
+from stream_diagnostics import StreamDiagnosticsMiddleware
 
 
 def chunk(parts=None, finish=None):
@@ -42,6 +43,7 @@ def fake_client(stream):
 
 def app_for_client(client):
     app = FastAPI()
+    app.add_middleware(StreamDiagnosticsMiddleware)
     app.include_router(chat_router)
     app.state.credential_manager = SimpleNamespace(
         get_credentials=lambda: (object(), "test-project"), get_total_credentials=lambda: 1,

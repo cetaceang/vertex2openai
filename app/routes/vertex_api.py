@@ -1,4 +1,4 @@
-"""Forward native Vertex requests without interpreting their bodies or responses."""
+"""Forward native Vertex requests, with optional tool schema compatibility."""
 
 import logging
 import re
@@ -18,6 +18,8 @@ from starlette.concurrency import run_in_threadpool
 import config as app_config
 from auth import client_key_passthrough_enabled, get_api_key
 from project_id_discovery import discover_project_id
+from stream_diagnostics import emit_diagnostic
+from tool_schema_compat import rewrite_vertex_tool_schemas
 
 
 logger = logging.getLogger(__name__)
@@ -134,6 +136,15 @@ async def _forward_vertex(
         headers.update(auth_headers)
 
     body = await request.body()
+    if (app_config.VERTEX_TOOL_SCHEMA_COMPAT and request.method == "POST"
+            and raw_resource.endswith((b":generateContent", b":streamGenerateContent", b":countTokens"))
+            and not request.headers.get("content-encoding")):
+        body, changed = rewrite_vertex_tool_schemas(body)
+        if changed:
+            for name in ("content-md5", "digest"):
+                headers.pop(name, None)
+            emit_diagnostic("vertex_tool_schema_compat",
+                            request_id=getattr(request.state, "stream_diagnostic_id", None), declarations=changed)
     client = _new_http_client()
     try:
         upstream_request = client.build_request(request.method, url, headers=headers, content=body)
