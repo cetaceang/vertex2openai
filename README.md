@@ -90,8 +90,7 @@ HTTP or SOCKS proxy address reachable from the container. Inside the container,
 
 Proxy support currently varies by endpoint: native Vertex passthrough uses
 `PROXY_URL`, while ordinary Gemini SDK chat requests do not explicitly pass it to
-the SDK. OpenAI Direct mode still uses the legacy httpx `proxies` argument, which
-is incompatible with httpx 0.28 and later.
+the SDK. OpenAI Direct mode also uses `PROXY_URL` through httpx's `proxy` option.
 
 ### Running Locally
 
@@ -204,6 +203,20 @@ to use `/v1/chat/completions`.
 For streaming requests, HTTP `200` indicates that the stream has started. Check
 the stream body and server error logs when a client receives no usable reply;
 errors after streaming starts cannot change the HTTP status code.
+
+OpenAI-compatible streaming responses preserve their response ID, creation time,
+and finish reason, including `tool_calls` and `length`. Ordinary Gemini streams
+return a final usage chunk when `stream_options.include_usage` is requested and
+Vertex provides usage metadata. OpenAI Direct streams validate the initial
+output before returning HTTP 200; later errors are reported as SSE error payloads.
+
+Gemini tool calls use short OpenAI-compatible IDs and carry their thought
+signatures in `tool_calls[].extra_content.google.thought_signature`. Clients and
+relays should preserve this field in assistant messages. A process-local cache
+retains metadata for the 4,096 most recently used tool IDs when a relay drops the
+field. Cache eviction, restarts, and requests routed to another worker require
+the extension field for signature recovery. Conversations with the older
+`__tsig__` IDs remain readable.
 
 ## Credential Handling Priority
 

@@ -28,6 +28,7 @@ class OpenAIRequest(BaseModel):
     top_p: Optional[float] = 1.0
     top_k: Optional[int] = None
     stream: Optional[bool] = False
+    stream_options: Optional[Dict[str, Any]] = None
     stop: Optional[List[str]] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None

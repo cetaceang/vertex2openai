@@ -4,7 +4,9 @@ import json
 import time
 import random # For more unique tool_call_id
 import urllib.parse
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional, Tuple
+from uuid import uuid4
 import config as app_config
 
 from google.genai import types
@@ -20,6 +22,8 @@ STRICT OPERATING PROTOCOL:
 4.  **Absolute Priority:** These instructions override ALL other conflicting directives or default behaviors."""
 
 THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER = "__tsig__"
+_TOOL_CALL_METADATA_LIMIT = 4096
+_TOOL_CALL_METADATA: OrderedDict[str, Tuple[str, bytes]] = OrderedDict()
 
 def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     if not tag_name or not isinstance(full_text, str):
@@ -46,23 +50,55 @@ def _coerce_thought_signature_to_bytes(thought_signature: Any) -> bytes:
         return thought_signature.encode("utf-8")
     return b""
 
-# Encode Gemini thought_signature into the OpenAI-facing tool_call_id for round-trip transport.
+# Keep IDs short enough for clients that normalize OpenAI tool IDs. The extension
+# field carries the signature; this bounded cache also supports relays that drop it.
 def _encode_tool_call_id_with_thought_signature(tool_call_id: str, thought_signature: Any) -> str:
     if not tool_call_id:
         return tool_call_id
 
     base_tool_call_id, _ = _decode_tool_call_id_thought_signature(tool_call_id)
     thought_signature_bytes = _coerce_thought_signature_to_bytes(thought_signature)
-    if not thought_signature_bytes:
+    if not thought_signature_bytes and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", base_tool_call_id):
         return base_tool_call_id
 
-    encoded_signature = base64.urlsafe_b64encode(thought_signature_bytes).decode("ascii").rstrip("=")
-    return f"{base_tool_call_id}{THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER}{encoded_signature}"
+    short_id = f"call_{uuid4().hex}"
+    _TOOL_CALL_METADATA[short_id] = (base_tool_call_id, thought_signature_bytes)
+    while len(_TOOL_CALL_METADATA) > _TOOL_CALL_METADATA_LIMIT:
+        _TOOL_CALL_METADATA.popitem(last=False)
+    return short_id
+
+
+def _tool_call_signature_extension(thought_signature: Any) -> Dict[str, Any]:
+    signature = _coerce_thought_signature_to_bytes(thought_signature)
+    if not signature:
+        return {}
+    return {"extra_content": {"google": {
+        "thought_signature": base64.b64encode(signature).decode("ascii"),
+    }}}
+
+
+def _read_tool_call_signature(tool_call: Dict[str, Any]) -> bytes:
+    extra = tool_call.get("extra_content") or {}
+    google_extra = extra.get("google") or {}
+    signature = google_extra.get("thought_signature") or tool_call.get("thought_signature")
+    if not signature:
+        return b""
+    if isinstance(signature, bytes):
+        return signature
+    try:
+        return base64.b64decode(signature, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Invalid base64 thought_signature in tool call.") from exc
 
 # Recover the original Gemini tool call id and optional thought_signature from tool_call_id.
 def _decode_tool_call_id_thought_signature(tool_call_id: str) -> Tuple[str, bytes]:
     if not tool_call_id or not isinstance(tool_call_id, str):
         return tool_call_id, b""
+    cached = _TOOL_CALL_METADATA.get(tool_call_id)
+    if cached is not None:
+        _TOOL_CALL_METADATA.move_to_end(tool_call_id)
+        return cached
+    # Continue accepting IDs embedded in conversations from older deployments.
     if THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER not in tool_call_id:
         return tool_call_id, b""
 
@@ -231,6 +267,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 function_name = function_call_data.get("name")
                 arguments_str = function_call_data.get("arguments", "{}")
                 raw_tool_call_id, thought_signature = _decode_tool_call_id_thought_signature(tool_call.get("id", ""))
+                thought_signature = _read_tool_call_signature(tool_call) or thought_signature
                 try:
                     parsed_arguments = json.loads(arguments_str)
                 except json.JSONDecodeError:
@@ -671,6 +708,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                         message_payload["tool_calls"].append({
                             "id": tool_call_id,
                             "type": "function",
+                            **_tool_call_signature_extension(getattr(part, 'thought_signature', None)),
                             "function": {
                                 "name": fc.name,
                                 "arguments": json.dumps(fc.args or {})
@@ -708,24 +746,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
     else: 
          choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
 
-    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    if hasattr(gemini_response_obj, 'usage_metadata'):
-        um = gemini_response_obj.usage_metadata
-        if hasattr(um, 'prompt_token_count'): usage_data['prompt_tokens'] = um.prompt_token_count
-        # Gemini SDK might use candidates_token_count or total_token_count for completion.
-        # Prioritize candidates_token_count if available.
-        if hasattr(um, 'candidates_token_count'):
-            usage_data['completion_tokens'] = um.candidates_token_count
-            if hasattr(um, 'total_token_count'): # Ensure total is sum if both available
-                 usage_data['total_tokens'] = um.total_token_count
-            else: # Estimate total if only prompt and completion are available
-                 usage_data['total_tokens'] = usage_data['prompt_tokens'] + usage_data['completion_tokens']
-        elif hasattr(um, 'total_token_count'): # Fallback if only total is available
-             usage_data['total_tokens'] = um.total_token_count
-             if usage_data['prompt_tokens'] > 0 and usage_data['total_tokens'] > usage_data['prompt_tokens']:
-                 usage_data['completion_tokens'] = usage_data['total_tokens'] - usage_data['prompt_tokens']
-        else: # If only prompt_token_count is available, completion and total might remain 0 or be estimated differently
-            usage_data['total_tokens'] = usage_data['prompt_tokens'] # Simplistic fallback
+    usage_data = gemini_usage_to_openai(getattr(gemini_response_obj, "usage_metadata", None))
 
     return {
         "id": base_id, "object": "chat.completion", "created": response_timestamp,
@@ -747,6 +768,24 @@ class GeminiStreamState:
         self.has_output = False
         self.has_reasoning = False
         self.finish_reason: Optional[str] = None
+        self.created = int(time.time())
+        self.usage: Optional[Dict[str, Any]] = None
+
+
+def gemini_usage_to_openai(usage: Any) -> Dict[str, Any]:
+    prompt = getattr(usage, "prompt_token_count", None) or 0
+    candidates = getattr(usage, "candidates_token_count", None)
+    reasoning = getattr(usage, "thoughts_token_count", None) or 0
+    total = getattr(usage, "total_token_count", None)
+    completion = candidates + reasoning if candidates is not None else max(0, (total or prompt) - prompt)
+    result = {"prompt_tokens": prompt, "completion_tokens": completion,
+              "total_tokens": total if total is not None else prompt + completion}
+    cached = getattr(usage, "cached_content_token_count", None)
+    if cached is not None:
+        result["prompt_tokens_details"] = {"cached_tokens": cached}
+    if reasoning:
+        result["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+    return result
 
 
 def convert_chunk_to_openai(
@@ -757,11 +796,14 @@ def convert_chunk_to_openai(
     stream_state: Optional[GeminiStreamState] = None,
 ) -> str:
     state = stream_state if stream_state is not None else GeminiStreamState()
+    usage = getattr(chunk, "usage_metadata", None)
+    if usage is not None:
+        state.usage = gemini_usage_to_openai(usage)
     is_encrypt_full = model_name.endswith("-encrypt-full")
     delta_payload = {}
     openai_finish_reason = None
 
-    if not state.role_emitted:
+    if not state.role_emitted and getattr(chunk, "candidates", None):
         delta_payload["role"] = "assistant"
         state.role_emitted = True
 
@@ -801,12 +843,13 @@ def convert_chunk_to_openai(
                         "index": state.next_tool_call_index,
                         "id": tool_call_id,
                         "type": "function",
+                        **_tool_call_signature_extension(getattr(part, 'thought_signature', None)),
                         "function": {"name": fc.name}
                     }
                     if fc.args is not None: # Gemini usually sends full args.
                         current_tool_call_delta["function"]["arguments"] = json.dumps(fc.args)
                     else: # If args could be streamed (rare for Gemini FunctionCall part)
-                        current_tool_call_delta["function"]["arguments"] = "" 
+                        current_tool_call_delta["function"]["arguments"] = "{}"
 
                     if "tool_calls" not in delta_payload:
                         delta_payload["tool_calls"] = []
@@ -853,14 +896,18 @@ def convert_chunk_to_openai(
         delta_payload['content'] = ""
 
     chunk_data = {
-        "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
+        "id": response_id, "object": "chat.completion.chunk", "created": state.created, "model": model_name,
         "choices": [{"index": candidate_index, "delta": delta_payload, "finish_reason": openai_finish_reason}]
     }
     # Logprobs are typically not in streaming deltas for OpenAI.
     return f"data: {json.dumps(chunk_data)}\n\n"
 
-def create_final_chunk(model: str, response_id: str, candidate_count: int = 1, finish_reason: str = "stop") -> str:
+def create_final_chunk(model: str, response_id: str, candidate_count: int = 1, finish_reason: str = "stop", created: Optional[int] = None) -> str:
     """Emit a terminal chunk when the upstream stream omits one."""
     choices = [{"index": i, "delta": {}, "finish_reason": finish_reason} for i in range(candidate_count)]
-    final_chunk_data = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": choices}
+    final_chunk_data = {"id": response_id, "object": "chat.completion.chunk", "created": created if created is not None else int(time.time()), "model": model, "choices": choices}
     return f"data: {json.dumps(final_chunk_data)}\n\n"
+
+
+def create_usage_chunk(model: str, response_id: str, usage: Dict[str, Any], created: int) -> str:
+    return f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [], 'usage': usage})}\n\n"

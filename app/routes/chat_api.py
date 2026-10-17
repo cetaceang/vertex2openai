@@ -21,6 +21,7 @@ from message_processing import (
 from api_helpers import (
     create_generation_config, # Corrected import name
     create_openai_error_response,
+    upstream_error_status,
     execute_gemini_call,
 )
 from openai_handler import OpenAIDirectHandler
@@ -285,4 +286,5 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     except Exception as e:
         error_msg = f"Unexpected error in chat_completions endpoint: {str(e)}"
         print(error_msg)
-        return JSONResponse(status_code=500, content=create_openai_error_response(500, error_msg, "server_error"))
+        status = upstream_error_status(e)
+        return JSONResponse(status_code=status, content=create_openai_error_response(status, error_msg, "server_error"))

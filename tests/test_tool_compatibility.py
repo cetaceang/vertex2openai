@@ -1,4 +1,6 @@
 import copy
+import base64
+from collections import OrderedDict
 import json
 from pathlib import Path
 import sys
@@ -15,9 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 from api_helpers import create_generation_config, execute_gemini_call
 from message_processing import (
     _encode_tool_call_id_with_thought_signature,
+    _decode_tool_call_id_thought_signature,
+    convert_to_openai_format,
     create_gemini_prompt,
 )
 from models import OpenAIMessage, OpenAIRequest
+import message_processing
 
 
 def complex_tool_schema():
@@ -196,6 +201,85 @@ class ToolMessageTests(unittest.TestCase):
                 ])
 
                 self.assertEqual(converted[0].parts[0].function_response.name, "run")
+
+
+class ToolSignatureCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(message_processing, "_TOOL_CALL_METADATA", OrderedDict())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def response(self):
+        self.signature = b"opaque-signature\x00\xff" * 100
+        response = types.GenerateContentResponse(candidates=[types.Candidate(
+            content=types.Content(role="model", parts=[types.Part(
+                function_call=types.FunctionCall(id="vertex-original", name="run", args={}),
+                thought_signature=self.signature,
+            )]), finish_reason="STOP",
+        )])
+        return convert_to_openai_format(response, "gemini-test")["choices"][0]["message"]["tool_calls"][0]
+
+    def round_trip(self, call):
+        return create_gemini_prompt([
+            OpenAIMessage(role="assistant", tool_calls=[call]),
+            OpenAIMessage(role="tool", tool_call_id=call["id"], content="done"),
+        ])
+
+    def test_short_ids_and_standard_signature_extension_survive_client_normalization(self):
+        call = self.response()
+        self.assertLessEqual(len(call["id"]), 40)
+        self.assertRegex(call["id"], r"^call_[A-Za-z0-9_-]+$")
+        self.assertEqual(base64.b64decode(call["extra_content"]["google"]["thought_signature"]), self.signature)
+        call["id"] = call["id"][:40]
+        converted = self.round_trip(call)
+        self.assertEqual(converted[0].parts[0].thought_signature, self.signature)
+        self.assertEqual(converted[0].parts[0].function_call.id, "vertex-original")
+        self.assertEqual(converted[1].parts[0].function_response.id, "vertex-original")
+
+    def test_relay_can_drop_extension_and_still_use_the_cached_signature(self):
+        call = self.response()
+        del call["extra_content"]
+        self.assertEqual(self.round_trip(call)[0].parts[0].thought_signature, self.signature)
+
+    def test_preserved_extension_survives_a_cache_reset(self):
+        call = self.response()
+        message_processing._TOOL_CALL_METADATA.clear()
+        converted = self.round_trip(call)
+        self.assertEqual(converted[0].parts[0].thought_signature, self.signature)
+        self.assertEqual(converted[0].parts[0].function_call.id, converted[1].parts[0].function_response.id)
+
+    def test_streamed_tool_signature_survives_a_cache_reset(self):
+        signature = b"stream-signature\x00\xff"
+        response = types.GenerateContentResponse(candidates=[types.Candidate(
+            content=types.Content(role="model", parts=[types.Part(
+                function_call=types.FunctionCall(id="vertex-original", name="run", args={}),
+                thought_signature=signature,
+            )]), finish_reason="STOP",
+        )])
+        frame = message_processing.convert_chunk_to_openai(response, "gemini-test", "response-id")
+        call = json.loads(frame.removeprefix("data: "))["choices"][0]["delta"]["tool_calls"][0]
+        message_processing._TOOL_CALL_METADATA.clear()
+        self.assertLessEqual(len(call["id"]), 40)
+        self.assertEqual(self.round_trip(call)[0].parts[0].thought_signature, signature)
+
+    def test_legacy_embedded_signatures_are_still_accepted(self):
+        signature = b"legacy\x00\xff"
+        encoded = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+        call = tool_call(f"fc-original__tsig__{encoded}", "run")
+        converted = self.round_trip(call)
+        self.assertEqual(converted[0].parts[0].function_call.id, "fc-original")
+        self.assertEqual(converted[0].parts[0].thought_signature, signature)
+
+    def test_signature_cache_is_bounded_and_keeps_recently_used_entries(self):
+        with patch.object(message_processing, "_TOOL_CALL_METADATA_LIMIT", 2):
+            first = _encode_tool_call_id_with_thought_signature("one", b"sig1")
+            second = _encode_tool_call_id_with_thought_signature("two", b"sig2")
+            self.assertEqual(_decode_tool_call_id_thought_signature(first), ("one", b"sig1"))
+            third = _encode_tool_call_id_with_thought_signature("three", b"sig3")
+        self.assertEqual(len(message_processing._TOOL_CALL_METADATA), 2)
+        self.assertEqual(_decode_tool_call_id_thought_signature(second), (second, b""))
+        self.assertEqual(_decode_tool_call_id_thought_signature(first), ("one", b"sig1"))
+        self.assertEqual(_decode_tool_call_id_thought_signature(third), ("three", b"sig3"))
 
 
 class GeminiStreamingTests(unittest.IsolatedAsyncioTestCase):

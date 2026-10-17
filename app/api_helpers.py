@@ -15,6 +15,7 @@ from message_processing import (
     convert_to_openai_format,
     convert_chunk_to_openai,
     create_final_chunk,
+    create_usage_chunk,
     GeminiStreamState,
     extract_reasoning_by_tags,
     _create_safety_ratings_html
@@ -24,89 +25,55 @@ from config import VERTEX_REASONING_TAG
 
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
-        self.tag_name = tag_name
         self.open_tag = f"<{tag_name}>"
         self.close_tag = f"</{tag_name}>"
         self.tag_buffer = ""
         self.inside_tag = False
-        self.reasoning_buffer = ""
-        self.partial_tag_buffer = "" 
 
     def process_chunk(self, content: str) -> tuple[str, str]:
-        if self.partial_tag_buffer:
-            content = self.partial_tag_buffer + content
-            self.partial_tag_buffer = ""
         self.tag_buffer += content
-        processed_content = ""
-        current_reasoning = ""
+        visible, reasoning = [], []
         while self.tag_buffer:
-            if not self.inside_tag:
-                open_pos = self.tag_buffer.find(self.open_tag)
-                if open_pos == -1:
-                    partial_match = False
-                    for i in range(1, min(len(self.open_tag), len(self.tag_buffer) + 1)):
-                        if self.tag_buffer[-i:] == self.open_tag[:i]:
-                            partial_match = True
-                            if len(self.tag_buffer) > i:
-                                processed_content += self.tag_buffer[:-i]
-                                self.partial_tag_buffer = self.tag_buffer[-i:]
-                            else: self.partial_tag_buffer = self.tag_buffer
-                            self.tag_buffer = ""
-                            break
-                    if not partial_match:
-                        processed_content += self.tag_buffer
-                        self.tag_buffer = ""
-                    break
-                else:
-                    processed_content += self.tag_buffer[:open_pos]
-                    self.tag_buffer = self.tag_buffer[open_pos + len(self.open_tag):]
-                    self.inside_tag = True
-            else: 
-                close_pos = self.tag_buffer.find(self.close_tag)
-                if close_pos == -1:
-                    partial_match = False
-                    for i in range(1, min(len(self.close_tag), len(self.tag_buffer) + 1)):
-                        if self.tag_buffer[-i:] == self.close_tag[:i]:
-                            partial_match = True
-                            if len(self.tag_buffer) > i:
-                                new_reasoning = self.tag_buffer[:-i]
-                                self.reasoning_buffer += new_reasoning
-                                if new_reasoning: current_reasoning = new_reasoning
-                                self.partial_tag_buffer = self.tag_buffer[-i:]
-                            else: self.partial_tag_buffer = self.tag_buffer
-                            self.tag_buffer = ""
-                            break
-                    if not partial_match:
-                        if self.tag_buffer:
-                            self.reasoning_buffer += self.tag_buffer
-                            current_reasoning = self.tag_buffer
-                            self.tag_buffer = ""
-                    break
-                else:
-                    final_reasoning_chunk = self.tag_buffer[:close_pos]
-                    self.reasoning_buffer += final_reasoning_chunk
-                    if final_reasoning_chunk: current_reasoning = final_reasoning_chunk
-                    self.reasoning_buffer = "" 
-                    self.tag_buffer = self.tag_buffer[close_pos + len(self.close_tag):]
-                    self.inside_tag = False
-        return processed_content, current_reasoning
-    
+            delimiter = self.close_tag if self.inside_tag else self.open_tag
+            output = reasoning if self.inside_tag else visible
+            position = self.tag_buffer.find(delimiter)
+            if position >= 0:
+                output.append(self.tag_buffer[:position])
+                self.tag_buffer = self.tag_buffer[position + len(delimiter):]
+                self.inside_tag = not self.inside_tag
+                continue
+            # Retain only a possible delimiter prefix across packet boundaries.
+            pending = 0
+            for length in range(1, min(len(delimiter), len(self.tag_buffer) + 1)):
+                if self.tag_buffer.endswith(delimiter[:length]):
+                    pending = length
+            if pending:
+                output.append(self.tag_buffer[:-pending])
+                self.tag_buffer = self.tag_buffer[-pending:]
+            else:
+                output.append(self.tag_buffer)
+                self.tag_buffer = ""
+            break
+        return "".join(visible), "".join(reasoning)
+
     def flush_remaining(self) -> tuple[str, str]:
-        remaining_content, remaining_reasoning = "", ""
-        if self.partial_tag_buffer:
-            remaining_content += self.partial_tag_buffer
-            self.partial_tag_buffer = ""
-        if not self.inside_tag:
-            if self.tag_buffer: remaining_content += self.tag_buffer
-        else:
-            if self.reasoning_buffer: remaining_reasoning = self.reasoning_buffer
-            if self.tag_buffer: remaining_content += self.tag_buffer
-            self.inside_tag = False
-        self.tag_buffer, self.reasoning_buffer = "", ""
-        return remaining_content, remaining_reasoning
+        remaining = self.tag_buffer
+        inside = self.inside_tag
+        self.tag_buffer = ""
+        self.inside_tag = False
+        return ("", remaining) if inside else (remaining, "")
 
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
     return {"error": {"message": message, "type": error_type, "code": status_code, "param": None}}
+
+
+def upstream_error_status(error: Exception) -> int:
+    for status in (getattr(error, "status_code", None), getattr(error, "code", None),
+                   getattr(getattr(error, "response", None), "status_code", None)):
+        if isinstance(status, int) and 400 <= status < 600:
+            return status
+    return 500
+
 
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
@@ -222,7 +189,8 @@ def is_gemini_response_valid(response: Any) -> bool:
 async def _chunk_openai_response_dict_for_sse(
     openai_response_dict: Dict[str, Any],
     response_id_override: Optional[str] = None, 
-    model_name_override: Optional[str] = None
+    model_name_override: Optional[str] = None,
+    include_usage: bool = False,
 ):
     resp_id = response_id_override or openai_response_dict.get("id", f"chatcmpl-fakestream-{int(time.time())}")
     model_name = model_name_override or openai_response_dict.get("model", "unknown")
@@ -230,13 +198,15 @@ async def _chunk_openai_response_dict_for_sse(
     
     choices = openai_response_dict.get("choices", [])
     if not choices: 
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'error'}]})}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+        raise ValueError("The upstream response contains no choices.")
 
     for choice_idx, choice in enumerate(choices): 
         message = choice.get("message", {})
         final_finish_reason = choice.get("finish_reason", "stop")
+        if message.get("tool_calls") and final_finish_reason == "stop":
+            final_finish_reason = "tool_calls"
+        choice_idx = choice.get("index", choice_idx)
+        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
         if message.get("tool_calls"):
             tool_calls_list = message.get("tool_calls", [])
@@ -246,6 +216,7 @@ async def _chunk_openai_response_dict_for_sse(
                         "index": tc_item_idx, 
                         "id": tool_call_item["id"],
                         "type": "function",
+                        **({"extra_content": tool_call_item["extra_content"]} if "extra_content" in tool_call_item else {}),
                         "function": {"name": tool_call_item["function"]["name"], "arguments": ""}
                     }]
                 }
@@ -255,14 +226,13 @@ async def _chunk_openai_response_dict_for_sse(
                 delta_tc_args = {
                     "tool_calls": [{
                         "index": tc_item_idx,
-                        "id": tool_call_item["id"], 
                         "function": {"arguments": tool_call_item["function"]["arguments"]}
                     }]
                 }
                 yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_tc_args, 'finish_reason': None}]})}\n\n"
                 await asyncio.sleep(0.01)
         
-        elif message.get("content") is not None or message.get("reasoning_content") is not None : 
+        if message.get("content") is not None or message.get("reasoning_content") is not None :
             reasoning_content = message.get("reasoning_content", "")
             actual_content = message.get("content") 
 
@@ -283,6 +253,8 @@ async def _chunk_openai_response_dict_for_sse(
         
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
 
+    if include_usage and openai_response_dict.get("usage") is not None:
+        yield create_usage_chunk(model_name, resp_id, openai_response_dict["usage"], created_time)
     yield "data: [DONE]\n\n"
 
 
@@ -308,8 +280,7 @@ async def gemini_fake_stream_generator(
     outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
     if outer_keep_alive_interval > 0:
         while not api_call_task.done():
-            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+            yield ": keep-alive\n\n"
             await asyncio.sleep(outer_keep_alive_interval)
     
     try:
@@ -326,7 +297,8 @@ async def gemini_fake_stream_generator(
             raise ValueError(block_message)
 
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
-            openai_response_dict=openai_response_dict
+            openai_response_dict=openai_response_dict,
+            include_usage=bool((request_obj.stream_options or {}).get("include_usage")),
         ):
             yield chunk_sse
 
@@ -363,8 +335,7 @@ async def openai_fake_stream_generator(
     outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
     if outer_keep_alive_interval > 0:
         while not api_call_task.done():
-            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+            yield ": keep-alive\n\n"
             await asyncio.sleep(outer_keep_alive_interval)
 
     try:
@@ -386,7 +357,7 @@ async def openai_fake_stream_generator(
            isinstance(openai_response_dict["choices"], list) and \
            len(openai_response_dict["choices"]) > 0:
             
-            first_choice_dict_item = openai_response_dict["choices"]
+            first_choice_dict_item = openai_response_dict["choices"][0]
             if first_choice_dict_item and isinstance(first_choice_dict_item, dict) :
                 choice_message_ref = first_choice_dict_item.get("message", {})
                 original_content = choice_message_ref.get("content")
@@ -399,7 +370,8 @@ async def openai_fake_stream_generator(
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict,
             response_id_override=response_id, 
-            model_name_override=request_obj.model
+            model_name_override=request_obj.model,
+            include_usage=bool((request_obj.stream_options or {}).get("include_usage")),
         ):
             yield chunk_sse
             
@@ -444,22 +416,27 @@ async def execute_gemini_call(
                 contents=actual_prompt_for_call,
                 config=gen_config_dict
             )
-            response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+            response_id_for_stream = f"chatcmpl-realstream-{time.time_ns()}"
             stream_state = GeminiStreamState()
 
             async def close_stream():
                 close = getattr(stream_gen_obj, "aclose", None)
                 if close is not None:
-                    await close()
+                    try:
+                        await close()
+                    except Exception as error:
+                        print(f"WARNING: Could not close the Gemini response stream: {error}")
 
             # Some SDK/network errors are deferred until the iterator is consumed.
             # Wait for text, reasoning, or a tool call before sending HTTP 200.
             initial_chunks = []
             try:
                 async for first_chunk in stream_gen_obj:
-                    initial_chunks.append(convert_chunk_to_openai(
+                    event = convert_chunk_to_openai(
                         first_chunk, request_obj.model, response_id_for_stream, 0, stream_state
-                    ))
+                    )
+                    if getattr(first_chunk, "candidates", None):
+                        initial_chunks.append(event)
                     if stream_state.has_output or stream_state.has_reasoning:
                         break
                 if not stream_state.has_output and not stream_state.has_reasoning:
@@ -473,14 +450,18 @@ async def execute_gemini_call(
                     for initial_chunk in initial_chunks:
                         yield initial_chunk
                     async for chunk_item_call in stream_gen_obj:
-                        yield convert_chunk_to_openai(
+                        event = convert_chunk_to_openai(
                             chunk_item_call, request_obj.model, response_id_for_stream, 0, stream_state
                         )
+                        if getattr(chunk_item_call, "candidates", None):
+                            yield event
                     if not stream_state.has_output:
                         raise ValueError("Gemini returned no text or tool calls before the stream ended.")
                     if stream_state.finish_reason is None:
                         finish_reason = "tool_calls" if stream_state.next_tool_call_index else "stop"
-                        yield create_final_chunk(request_obj.model, response_id_for_stream, finish_reason=finish_reason)
+                        yield create_final_chunk(request_obj.model, response_id_for_stream, finish_reason=finish_reason, created=stream_state.created)
+                    if (request_obj.stream_options or {}).get("include_usage") and stream_state.usage is not None:
+                        yield create_usage_chunk(request_obj.model, response_id_for_stream, stream_state.usage, stream_state.created)
                     yield "data: [DONE]\n\n"
                 except Exception as e_stream_call:
                     err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
@@ -493,7 +474,8 @@ async def execute_gemini_call(
                     yield "data: [DONE]\n\n"
                 finally:
                     await close_stream()
-            return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
+            return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else: # Non-streaming
         response_obj_call = await current_client.aio.models.generate_content(
             model=model_to_call, 

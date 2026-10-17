@@ -5,7 +5,9 @@ This module encapsulates all OpenAI-specific logic that was previously in chat_a
 import json
 import time
 import httpx
+import inspect
 from typing import Dict, Any, AsyncGenerator
+from uuid import uuid4
 
 from fastapi.responses import JSONResponse, StreamingResponse
 import openai
@@ -15,12 +17,21 @@ from config import VERTEX_REASONING_TAG
 import config as app_config
 from api_helpers import (
     create_openai_error_response,
+    upstream_error_status,
     openai_fake_stream_generator,
     StreamingReasoningProcessor
 )
 from message_processing import extract_reasoning_by_tags
 from credentials_manager import _refresh_auth
 from project_id_discovery import discover_project_id
+
+
+def _stream_chunk_has_output(payload: Dict[str, Any]) -> bool:
+    return any(
+        any((choice.get("delta") or {}).get(key) for key in
+            ("content", "reasoning_content", "tool_calls", "refusal"))
+        for choice in payload.get("choices") or []
+    )
 
 
 # Wrapper classes to mimic OpenAI SDK responses for direct httpx calls
@@ -57,19 +68,57 @@ class ExpressClientWrapper:
         self.chat = self
         self.completions = self
 
+    @staticmethod
+    def _raise_for_status(response: httpx.Response):
+        if not response.is_error:
+            response.raise_for_status()
+            return
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error = body.get("error", body) if isinstance(body, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        # Preserve Google's diagnostic without exposing the key in the URL.
+        raise openai.APIStatusError(message or f"Vertex returned HTTP {response.status_code}.",
+                                    response=response, body=error)
+
     async def _stream_generator(self, response: httpx.Response) -> AsyncGenerator[FakeChatCompletionChunk, None]:
-        """Processes the SSE stream from httpx and yields fake chunk objects."""
+        """Decode complete SSE events, including data fields without a space."""
+        def decode(data, event_name=""):
+            if data.strip() == "[DONE]":
+                return None
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Invalid JSON in the upstream OpenAI SSE stream.") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("The upstream OpenAI SSE event must be an object.")
+            if payload.get("error") or event_name == "error":
+                error = payload.get("error") or payload
+                message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+                raise openai.APIError(message, request=response.request, body=error)
+            return FakeChatCompletionChunk(payload)
+
+        data_lines = []
+        event_name = ""
         async for line in response.aiter_lines():
-            if line.startswith("data:"):
-                json_str = line[len("data: "):].strip()
-                if json_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(json_str)
-                    yield FakeChatCompletionChunk(data)
-                except json.JSONDecodeError:
-                    print(f"Warning: Could not decode JSON from stream line: {json_str}")
-                    continue
+            if line == "":
+                if data_lines:
+                    event = decode("\n".join(data_lines), event_name)
+                    data_lines = []
+                    if event is None:
+                        return
+                    yield event
+                event_name = ""
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].removeprefix(" "))
+            elif line.startswith("event:"):
+                event_name = line[6:].removeprefix(" ")
+        if data_lines:
+            event = decode("\n".join(data_lines), event_name)
+            if event is not None:
+                yield event
 
     async def _streaming_create(self, **kwargs) -> AsyncGenerator[FakeChatCompletionChunk, None]:
         """Handles the creation of a streaming request using httpx."""
@@ -81,21 +130,16 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        proxies = None
-        if app_config.PROXY_URL:
-            if app_config.PROXY_URL.startswith("socks"):
-                proxies = {"all://": app_config.PROXY_URL}
-            else:
-                proxies = {"https://": app_config.PROXY_URL}
-
         client_args = {'timeout': 300}
-        if proxies:
-            client_args['proxies'] = proxies
+        if app_config.PROXY_URL:
+            client_args['proxy'] = app_config.PROXY_URL
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
         async with httpx.AsyncClient(**client_args) as client:
             async with client.stream("POST", endpoint, headers=headers, params=params, json=payload, timeout=None) as response:
-                response.raise_for_status()
+                if response.is_error:
+                    await response.aread()
+                self._raise_for_status(response)
                 async for chunk in self._stream_generator(response):
                     yield chunk
 
@@ -119,21 +163,14 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        proxies = None
-        if app_config.PROXY_URL:
-            if app_config.PROXY_URL.startswith("socks"):
-                proxies = {"all://": app_config.PROXY_URL}
-            else:
-                proxies = {"https://": app_config.PROXY_URL}
-
         client_args = {'timeout': 300}
-        if proxies:
-            client_args['proxies'] = proxies
+        if app_config.PROXY_URL:
+            client_args['proxy'] = app_config.PROXY_URL
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
         async with httpx.AsyncClient(**client_args) as client:
             response = await client.post(endpoint, headers=headers, params=params, json=payload, timeout=None)
-            response.raise_for_status()
+            self._raise_for_status(response)
             return FakeChatCompletion(response.json())
 
 
@@ -165,16 +202,9 @@ class OpenAIDirectHandler:
             f"projects/{project_id}/locations/{location}/endpoints/openapi"
         )
         
-        proxies = None
-        if app_config.PROXY_URL:
-            if app_config.PROXY_URL.startswith("socks"):
-                proxies = {"all://": app_config.PROXY_URL}
-            else:
-                proxies = {"https://": app_config.PROXY_URL}
-
         client_args = {}
-        if proxies:
-            client_args['proxies'] = proxies
+        if app_config.PROXY_URL:
+            client_args['proxy'] = app_config.PROXY_URL
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
         
@@ -209,14 +239,10 @@ class OpenAIDirectHandler:
     def prepare_extra_body(self) -> Dict[str, Any]:
         """Prepare extra body parameters for OpenAI API call."""
         return {
-            "extra_body": {
-                'google': {
-                    'safety_settings': self.safety_settings,
-                    'thought_tag_marker': VERTEX_REASONING_TAG,
-                    "thinking_config": {
-                        "include_thoughts": True
-                    }
-                }
+            'google': {
+                'safety_settings': self.safety_settings,
+                'thought_tag_marker': VERTEX_REASONING_TAG,
+                "thinking_config": {"include_thoughts": True},
             }
         }
     
@@ -242,156 +268,144 @@ class OpenAIDirectHandler:
             )
         else:
             print(f"INFO: OpenAI True Streaming ENABLED for model '{request.model}'.")
-            return StreamingResponse(
-                self._true_stream_generator(openai_client, openai_params, openai_extra_body, request),
-                media_type="text/event-stream"
-            )
-    
+            stream = self._true_stream_generator(openai_client, openai_params, openai_extra_body, request)
+            initial = []
+            try:
+                async for event in stream:
+                    if event == "data: [DONE]\n\n":
+                        raise ValueError("The upstream returned an empty OpenAI response stream.")
+                    initial.append(event)
+                    if _stream_chunk_has_output(json.loads(event.removeprefix("data: "))):
+                        break
+                else:
+                    raise ValueError("The upstream returned an empty OpenAI response stream.")
+            except BaseException:
+                await stream.aclose()
+                raise
+
+            async def body():
+                try:
+                    for event in initial:
+                        yield event
+                    async for event in stream:
+                        yield event
+                finally:
+                    await stream.aclose()
+
+            return StreamingResponse(body(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     async def _true_stream_generator(
         self,
-        openai_client: Any, # Can be openai.AsyncOpenAI or our wrapper
+        openai_client: Any,
         openai_params: Dict[str, Any],
         openai_extra_body: Dict[str, Any],
-        request: OpenAIRequest
+        request: OpenAIRequest,
     ) -> AsyncGenerator[str, None]:
-        """Generate true streaming response."""
+        """Preserve stream identity and each choice's terminal reason."""
+        stream_response = None
+        has_output = False
+        metadata = {}
+        processors = {}
+        finished = set()
+        tool_choices = set()
+        roles = set()
+
+        def frame(choices, **extra):
+            return f"data: {json.dumps({**metadata, 'choices': choices, **extra})}\n\n"
+
         try:
-            # Ensure stream=True is explicitly passed for real streaming
-            openai_params_for_stream = {**openai_params, "stream": True}
             stream_response = await openai_client.chat.completions.create(
-                **openai_params_for_stream,
-                extra_body=openai_extra_body
+                **{**openai_params, "stream": True}, extra_body=openai_extra_body,
             )
-            
-            # Create processor for tag-based extraction across chunks
-            reasoning_processor = StreamingReasoningProcessor(VERTEX_REASONING_TAG)
-            chunk_count = 0
-            has_sent_content = False
-            
             async for chunk in stream_response:
-                chunk_count += 1
-                try:
-                    chunk_as_dict = chunk.model_dump(exclude_unset=True, exclude_none=True)
-                    
-                    choices = chunk_as_dict.get('choices')
-                    if choices and isinstance(choices, list) and len(choices) > 0:
-                        delta = choices[0].get('delta')
-                        if delta and isinstance(delta, dict):
-                            # Always remove extra_content if present
-                            
-                            if 'extra_content' in delta:
-                                del delta['extra_content']
-                            
-                            content = delta.get('content', '')
-                            original_choice = chunk_as_dict['choices'][0]
-                            if content:
-                                # Use the processor to extract reasoning
-                                processed_content, current_reasoning = reasoning_processor.process_chunk(content)
-                                
-                                # Send chunks for both reasoning and content as they arrive
-                                original_finish_reason = original_choice.get('finish_reason')
-                                original_usage = original_choice.get('usage')
+                data = chunk.model_dump(exclude_unset=True, exclude_none=True)
+                if data.get("error"):
+                    error = data["error"]
+                    raise ValueError(error.get("message", str(error)) if isinstance(error, dict) else str(error))
+                if not metadata:
+                    metadata = {
+                        "id": data.get("id") or f"chatcmpl-{uuid4().hex}",
+                        "object": "chat.completion.chunk",
+                        "created": data.get("created") or int(time.time()),
+                        "model": data.get("model") or request.model,
+                    }
+                choices = []
+                for choice in data.get("choices") or []:
+                    choice = dict(choice)
+                    index = choice.get("index", 0)
+                    processor = processors.setdefault(index, StreamingReasoningProcessor(VERTEX_REASONING_TAG))
+                    delta = dict(choice.get("delta") or {})
+                    if index not in roles:
+                        delta.setdefault("role", "assistant")
+                        roles.add(index)
+                    if delta.get("tool_calls"):
+                        tool_choices.add(index)
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        visible, reasoning = processor.process_chunk(content)
+                        delta.pop("content", None)
+                        if visible:
+                            delta["content"] = visible
+                        if reasoning:
+                            delta["reasoning_content"] = (delta.get("reasoning_content") or "") + reasoning
+                    finish = choice.get("finish_reason")
+                    if finish:
+                        visible, reasoning = processor.flush_remaining()
+                        if visible:
+                            delta["content"] = (delta.get("content") or "") + visible
+                        if reasoning:
+                            delta["reasoning_content"] = (delta.get("reasoning_content") or "") + reasoning
+                        if finish == "stop" and index in tool_choices:
+                            finish = "tool_calls"
+                        finished.add(index)
+                    # Some compatible providers put usage on the choice.
+                    choice_usage = choice.pop("usage", None)
+                    if choice_usage is not None and data.get("usage") is None:
+                        data["usage"] = choice_usage
+                    choices.append({**choice, "delta": delta, "finish_reason": finish})
+                payload = {**data, **metadata, "choices": choices}
+                has_output = has_output or _stream_chunk_has_output(payload)
+                yield f"data: {json.dumps(payload)}\n\n"
 
-                                if current_reasoning:
-                                    reasoning_delta = {'reasoning_content': current_reasoning}
-                                    reasoning_payload = {
-                                        "id": chunk_as_dict["id"], "object": chunk_as_dict["object"],
-                                        "created": chunk_as_dict["created"], "model": chunk_as_dict["model"],
-                                        "choices": [{"index": 0, "delta": reasoning_delta, "finish_reason": None}]
-                                    }
-                                    yield f"data: {json.dumps(reasoning_payload)}\n\n"
-                                
-                                if processed_content:
-                                    content_delta = {'content': processed_content}
-                                    finish_reason_for_this_content_delta = None
-                                    usage_for_this_content_delta = None
-
-                                    if original_finish_reason and not reasoning_processor.inside_tag:
-                                        finish_reason_for_this_content_delta = original_finish_reason
-                                        if original_usage:
-                                            usage_for_this_content_delta = original_usage
-                                    
-                                    content_payload = {
-                                        "id": chunk_as_dict["id"], "object": chunk_as_dict["object"],
-                                        "created": chunk_as_dict["created"], "model": chunk_as_dict["model"],
-                                        "choices": [{"index": 0, "delta": content_delta, "finish_reason": finish_reason_for_this_content_delta}]
-                                    }
-                                    if usage_for_this_content_delta:
-                                        content_payload['choices'][0]['usage'] = usage_for_this_content_delta
-                                    
-                                    yield f"data: {json.dumps(content_payload)}\n\n"
-                                    has_sent_content = True
-                                
-                            elif original_choice.get('finish_reason'): # Check original_choice for finish_reason
-                                yield f"data: {json.dumps(chunk_as_dict)}\n\n"
-                            elif not content and not original_choice.get('finish_reason') :
-                                yield f"data: {json.dumps(chunk_as_dict)}\n\n"
-                    else:
-                        # Yield chunks without choices too (they might contain metadata)
-                        yield f"data: {json.dumps(chunk_as_dict)}\n\n"
-
-                except Exception as chunk_error:
-                    error_msg = f"Error processing OpenAI chunk for {request.model}: {str(chunk_error)}"
-                    print(f"ERROR: {error_msg}")
-                    if len(error_msg) > 1024:
-                        error_msg = error_msg[:1024] + "..."
-                    error_response = create_openai_error_response(500, error_msg, "server_error")
-                    yield f"data: {json.dumps(error_response)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-            
-            # Debug logging for buffer state and chunk count
-            # print(f"DEBUG: Stream ended after {chunk_count} chunks. Buffer state - tag_buffer: '{reasoning_processor.tag_buffer}', "
-            #       f"inside_tag: {reasoning_processor.inside_tag}, "
-            #       f"reasoning_buffer: '{reasoning_processor.reasoning_buffer[:50]}...' if reasoning_processor.reasoning_buffer else ''")
-            # Flush any remaining buffered content
-            remaining_content, remaining_reasoning = reasoning_processor.flush_remaining()
-            
-            # Send any remaining reasoning first
-            if remaining_reasoning:
-                reasoning_flush_payload = {
-                    "id": f"chatcmpl-flush-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": request.model,
-                    "choices": [{"index": 0, "delta": {"reasoning_content": remaining_reasoning}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(reasoning_flush_payload)}\n\n"
-            
-            # Send any remaining content
-            if remaining_content:
-                content_flush_payload = {
-                    "id": f"chatcmpl-flush-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": request.model,
-                    "choices": [{"index": 0, "delta": {"content": remaining_content}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(content_flush_payload)}\n\n"
-                has_sent_content = True
-            
-            # Always send a finish reason chunk
-            finish_payload = {
-                "id": f"chatcmpl-final-{int(time.time())}", # Kilo Code: Changed ID for clarity
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            }
-            yield f"data: {json.dumps(finish_payload)}\n\n"
-            
+            terminal_choices = []
+            for index, processor in processors.items():
+                if index in finished:
+                    continue
+                visible, reasoning = processor.flush_remaining()
+                delta = {}
+                if visible:
+                    delta["content"] = visible
+                if reasoning:
+                    delta["reasoning_content"] = reasoning
+                terminal_choices.append({"index": index, "delta": delta,
+                                         "finish_reason": "tool_calls" if index in tool_choices else "stop"})
+            has_output = has_output or _stream_chunk_has_output({"choices": terminal_choices})
+            if not has_output:
+                raise ValueError("The upstream returned no text, reasoning, refusal, or tool calls.")
+            if terminal_choices:
+                yield frame(terminal_choices)
             yield "data: [DONE]\n\n"
-            
-        except Exception as stream_error:
-            error_msg = str(stream_error)
-            if len(error_msg) > 1024:
-                error_msg = error_msg[:1024] + "..."
-            error_msg_full = f"Error during OpenAI streaming for {request.model}: {error_msg}"
-            print(f"ERROR: {error_msg_full}")
-            error_response = create_openai_error_response(500, error_msg_full, "server_error")
-            yield f"data: {json.dumps(error_response)}\n\n"
+        except Exception as error:
+            # Until meaningful output is available, callers can still return an
+            # HTTP error. Later failures must travel through the established SSE.
+            if not has_output:
+                raise
+            message = f"Error during OpenAI streaming for {request.model}: {error}"
+            print(f"ERROR: {message}")
+            yield f"data: {json.dumps(create_openai_error_response(500, message, 'server_error'))}\n\n"
             yield "data: [DONE]\n\n"
-    
+        finally:
+            if stream_response is not None:
+                close = getattr(stream_response, "close", None) or getattr(stream_response, "aclose", None)
+                if close is not None:
+                    try:
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as error:
+                        print(f"WARNING: Could not close the OpenAI response stream: {error}")
+
     async def handle_non_streaming_response(
         self,
         openai_client: Any, # Can be openai.AsyncOpenAI or our wrapper
@@ -443,9 +457,10 @@ class OpenAIDirectHandler:
         except Exception as e:
             error_msg = f"Error calling OpenAI client for {request.model}: {str(e)}"
             print(f"ERROR: {error_msg}")
+            status = upstream_error_status(e)
             return JSONResponse(
-                status_code=500, 
-                content=create_openai_error_response(500, error_msg, "server_error")
+                status_code=status,
+                content=create_openai_error_response(status, error_msg, "server_error")
             )
     
     async def process_request(self, request: OpenAIRequest, base_model_name: str, is_express: bool = False, is_openai_search: bool = False):
@@ -502,4 +517,5 @@ class OpenAIDirectHandler:
         except Exception as e:
             error_msg = f"Error in process_request for {request.model}: {e}"
             print(f"ERROR: {error_msg}")
-            return JSONResponse(status_code=500, content=create_openai_error_response(500, error_msg, "server_error"))
+            status = upstream_error_status(e)
+            return JSONResponse(status_code=status, content=create_openai_error_response(status, error_msg, "server_error"))

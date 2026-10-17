@@ -100,6 +100,46 @@ class GeminiStreamConversionTests(unittest.TestCase):
 
 @patch("api_helpers.app_config.FAKE_STREAMING_ENABLED", False)
 class GeminiStreamResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requested_usage_is_emitted_before_done_with_a_stable_identity(self):
+        async def stream():
+            yield chunk([types.Part(text="answer")], "STOP")
+            yield types.GenerateContentResponse(usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=10, candidates_token_count=4, thoughts_token_count=3,
+                total_token_count=17, cached_content_token_count=2,
+            ))
+
+        for include in (False, True):
+            with self.subTest(include=include):
+                request = OpenAIRequest(model="gemini-test", messages=[], stream=True,
+                                        stream_options={"include_usage": include})
+                response = await execute_gemini_call(fake_client(stream()), request.model, lambda messages: [], {}, request)
+                raw = [event async for event in response.body_iterator]
+                frames = [json.loads(event.removeprefix("data: ")) for event in raw[:-1]]
+                usages = [frame for frame in frames if "usage" in frame]
+                self.assertEqual(len(frames), 2 if include else 1)
+                self.assertEqual(len(usages), int(include))
+                if include:
+                    self.assertEqual(usages[0]["choices"], [])
+                    self.assertEqual(usages[0]["usage"], {
+                        "prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                        "completion_tokens_details": {"reasoning_tokens": 3},
+                    })
+                self.assertEqual(len({frame["id"] for frame in frames}), 1)
+                self.assertEqual(len({frame["created"] for frame in frames}), 1)
+                self.assertEqual(raw[-1], "data: [DONE]\n\n")
+
+    async def test_initial_usage_metadata_does_not_consume_the_assistant_role(self):
+        async def stream():
+            yield types.GenerateContentResponse(usage_metadata=types.GenerateContentResponseUsageMetadata(prompt_token_count=10))
+            yield chunk([types.Part(text="answer")], "STOP")
+
+        request = OpenAIRequest(model="gemini-test", messages=[], stream=True)
+        response = await execute_gemini_call(fake_client(stream()), request.model, lambda messages: [], {}, request)
+        raw = [event async for event in response.body_iterator]
+        self.assertEqual(len(raw), 2)
+        self.assertEqual(decode(raw[0])["delta"]["role"], "assistant")
+
     async def test_deferred_upstream_errors_return_http_500_before_streaming(self):
         async def stream():
             raise ValueError("upstream rejected the tool schema")
